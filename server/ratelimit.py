@@ -50,10 +50,13 @@ class RateLimiter:
             return True, self.limit - len(q), 0.0
 
 
-def install_rate_limit(app, limiter: RateLimiter, *, protect_prefix: str = "/v1") -> None:
+def install_rate_limit(
+    app, limiter: RateLimiter, *, protect_prefix: tuple[str, ...] = ("/v1", "/api/v1")
+) -> None:
     """Attach `limiter` to a FastAPI/Starlette app as HTTP middleware.
 
-    Only paths under `protect_prefix` are limited (so /healthz stays open). On
+    Only paths under one of `protect_prefix` are limited (so /healthz stays
+    open). Every routed prefix must be listed, or it silently goes unlimited. On
     every response we set the standard `X-RateLimit-*` headers; over-limit
     requests get a 429 with `Retry-After` and an OpenAI-shaped error body.
     """

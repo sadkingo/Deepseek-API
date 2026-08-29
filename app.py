@@ -15,9 +15,17 @@ from dotenv import load_dotenv
 load_dotenv()
 
 if __name__ == "__main__":
+    # Serve HTTPS when a cert pair is configured. A browser page loaded over
+    # https:// cannot call an http:// API (mixed content), so an internet-facing
+    # deployment needs TLS either here or behind a reverse proxy.
+    ssl_certfile = os.getenv("SSL_CERTFILE") or None
+    ssl_keyfile = os.getenv("SSL_KEYFILE") or None
+
     uvicorn.run(
         "server.api:app",
         host=os.getenv("HOST", "127.0.0.1"),
         port=int(os.getenv("PORT", "8000")),
         reload=False,
+        ssl_certfile=ssl_certfile,
+        ssl_keyfile=ssl_keyfile,
     )

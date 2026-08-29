@@ -22,7 +22,9 @@ session (see `deepseek.auth`). For each message it:
 from __future__ import annotations
 
 import json
+import os
 import threading
+import time
 from dataclasses import dataclass
 from typing import Iterator, Optional
 
@@ -33,6 +35,18 @@ from .pow import DeepSeekPow
 
 BASE = "https://chat.deepseek.com"
 COMPLETION_PATH = "/api/v0/chat/completion"
+
+# At most this many requests may talk to DeepSeek at once; the rest wait up to
+# DEEPSEEK_QUEUE_TIMEOUT seconds for a slot and then fail fast with ServerBusy.
+# One web account can't usefully serve more anyway (DeepSeek muted this account
+# once already for request spam), and the bound means a burst of retries piles
+# up as quick, visible errors instead of an ever-growing queue of stuck threads.
+MAX_CONCURRENCY = int(os.getenv("DEEPSEEK_MAX_CONCURRENCY", "4"))
+QUEUE_TIMEOUT = float(os.getenv("DEEPSEEK_QUEUE_TIMEOUT", "45"))
+
+
+class ServerBusy(RuntimeError):
+    """All upstream slots stayed occupied for the whole queue timeout."""
 
 # DeepSeek's mode pill, sent as `model_type` in the completion body. "default" is
 # Instant (the fast model); "expert" is the stronger, slower model. Omitting the
@@ -70,6 +84,27 @@ class Reply:
         return self.text
 
 
+def _biz_error(line: str) -> Optional[str]:
+    """The error message in a bare JSON body, if `line` is one.
+
+    A rejected completion request comes back as HTTP 200 with a plain JSON
+    envelope instead of an SSE stream (e.g. an empty prompt yields biz_code 6,
+    "missing prompt or ref file"). Without this the stream would just look
+    empty.
+    """
+    line = line.strip()
+    if not line.startswith("{"):
+        return None
+    try:
+        obj = json.loads(line)
+    except json.JSONDecodeError:
+        return None
+    data = obj.get("data") or {}
+    if obj.get("code") not in (None, 0) or data.get("biz_code") not in (None, 0):
+        return data.get("biz_msg") or obj.get("msg") or str(obj)
+    return None
+
+
 def _biz(data: dict) -> dict:
     """Unwrap DeepSeek's `data.biz_data` envelope, raising on API-level errors."""
     if data.get("code") != 0:
@@ -94,11 +129,19 @@ class DeepSeekClient:
         # The wasmtime Store behind the PoW solver is not reentrant; serialise
         # access so concurrent server requests don't corrupt it.
         self._pow_lock = threading.Lock()
+        self._gate = threading.BoundedSemaphore(MAX_CONCURRENCY)
+        # Wedge detection (see `wedged`): how many requests hold a gate slot,
+        # and when anything last moved (slot taken/released, SSE chunk arrived).
+        self._inflight = 0
+        self._progress_ts = time.time()
+        self._state_lock = threading.Lock()
         self._http = httpx.Client(
             base_url=BASE,
             headers=self._base_headers(),
             cookies=self.session.cookies,
-            timeout=httpx.Timeout(120.0, read=300.0),
+            # `pool` bounds how long a request may wait for a free connection —
+            # without it a wedged connection pool blocks callers forever.
+            timeout=httpx.Timeout(connect=30.0, read=300.0, write=120.0, pool=30.0),
         )
 
     def _base_headers(self) -> dict:
@@ -160,8 +203,9 @@ class DeepSeekClient:
             )
         session_id, parent_id = _decode_cid(conversation_id)
         if session_id is None:
-            # New thread: select the model (default when unspecified).
-            session_id = self.create_chat_session()
+            # New thread: select the model (default when unspecified). The chat
+            # session itself is created lazily on first iteration, inside the
+            # concurrency gate.
             model_type: Optional[str] = model or DEFAULT_MODEL_TYPE
         else:
             # Resuming: let the existing thread's model stand (send no model_type).
@@ -182,6 +226,27 @@ class DeepSeekClient:
         text = "".join(s)
         return Reply(text=text, conversation_id=s.conversation_id)
 
+    def _touch(self, delta: int = 0) -> None:
+        """Record upstream progress (and optionally adjust the in-flight count)."""
+        with self._state_lock:
+            self._inflight += delta
+            self._progress_ts = time.time()
+
+    def wedged(self, timeout: float) -> bool:
+        """True when every slot is taken and nothing has moved for `timeout` s.
+
+        This is the signature of the httpcore sync-pool deadlock we hit in
+        production (an abandoned streaming response finalised by the GC on a
+        thread that already held the pool lock, poisoning it forever): requests
+        enter, nothing ever completes, and no SSE chunk arrives. A healthy but
+        slow upstream keeps producing chunks, so it never trips this.
+        """
+        with self._state_lock:
+            return (
+                self._inflight >= MAX_CONCURRENCY
+                and time.time() - self._progress_ts > timeout
+            )
+
     def close(self) -> None:
         self._http.close()
 
@@ -190,9 +255,9 @@ class _Stream:
     """Iterable of reply-text chunks. After it's consumed, `.conversation_id`
     holds the token for resuming the conversation."""
 
-    def __init__(self, client: "DeepSeekClient", prompt: str, session_id: str,
-                 parent_id: Optional[int], model: str,
-                 thinking: bool, search: bool):
+    def __init__(self, client: "DeepSeekClient", prompt: str,
+                 session_id: Optional[str], parent_id: Optional[int],
+                 model: Optional[str], thinking: bool, search: bool):
         self._client = client
         self._prompt = prompt
         self._session_id = session_id
@@ -203,6 +268,25 @@ class _Stream:
         self._message_id: Optional[int] = None
 
     def __iter__(self) -> Iterator[str]:
+        # Everything that touches DeepSeek happens under the gate, so at most
+        # MAX_CONCURRENCY requests are upstream at once and the rest fail fast.
+        if not self._client._gate.acquire(timeout=QUEUE_TIMEOUT):
+            raise ServerBusy(
+                f"All {MAX_CONCURRENCY} upstream slots stayed busy for "
+                f"{QUEUE_TIMEOUT:.0f}s; the server is overloaded. Retry shortly."
+            )
+        self._client._touch(+1)
+        try:
+            for chunk in self._run():
+                self._client._touch()
+                yield chunk
+        finally:
+            self._client._touch(-1)
+            self._client._gate.release()
+
+    def _run(self) -> Iterator[str]:
+        if self._session_id is None:
+            self._session_id = self._client.create_chat_session()
         body = {
             "chat_session_id": self._session_id,
             "parent_message_id": self._parent_id,
@@ -226,6 +310,18 @@ class _Stream:
             yield from _parse_sse(resp.iter_lines(), meta)
         if meta.get("message_id") is not None:
             self._message_id = meta["message_id"]
+        else:
+            # No message id and no text: DeepSeek accepted the request (HTTP 200)
+            # but produced nothing. The usual cause is an over-long prompt — the
+            # "expert" model stops answering above roughly 164k characters, while
+            # "default" handles far more — and it reports this by staying silent.
+            raise RuntimeError(
+                "DeepSeek returned an empty response for a "
+                f"{len(self._prompt):,}-character prompt "
+                f"(model_type={self._model or 'inherited'}). It is most likely "
+                "too long for this model; try the deepseek-chat model or a "
+                "shorter prompt."
+            )
 
     @property
     def conversation_id(self) -> str:
@@ -249,7 +345,12 @@ def _parse_sse(lines, meta: Optional[dict] = None) -> Iterator[str]:
     emitted_initial = False
 
     for line in lines:
-        if not line or not line.startswith("data:"):
+        if not line:
+            continue
+        if not line.startswith("data:"):
+            err = _biz_error(line)
+            if err:
+                raise RuntimeError(f"DeepSeek rejected the request: {err}")
             continue
         payload = line[len("data:"):].strip()
         if not payload or payload == "[DONE]":
