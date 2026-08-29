@@ -443,11 +443,20 @@ class _Stream:
 # Unknown types therefore default to text as well: DeepSeek adds fragment kinds
 # over time, and dropping an unrecognised one costs the user their reply, while
 # including it at worst adds some stray text we can see and fix.
+#
+# "TIP" is the exception, and the reason that default needs a deny-list: it is
+# the web UI's own notice bar, not the model speaking. It carries lines like
+# "This response is AI-generated, for reference only." (style WARNING), which
+# DeepSeek shows beside the answer and would otherwise be appended to it.
 _FRAGMENT_KINDS = {"THINK": "thinking", "RESPONSE": "text", "READ_LINK": "text"}
+_SKIPPED_FRAGMENTS = {"TIP"}
 _DEFAULT_FRAGMENT_KIND = "text"
 
 
-def _fragment_kind(frag_type) -> str:
+def _fragment_kind(frag_type) -> Optional[str]:
+    """Event kind for a fragment type, or None when it is not reply content."""
+    if frag_type in _SKIPPED_FRAGMENTS:
+        return None
     return _FRAGMENT_KINDS.get(frag_type, _DEFAULT_FRAGMENT_KIND)
 
 
@@ -506,8 +515,9 @@ def _parse_sse(lines, meta: Optional[dict] = None) -> Iterator[tuple]:
                 _capture_message_id(meta, v)
             fragments = v["response"].get("fragments", [])
             for frag in fragments:
-                if frag.get("content") and not snapshot_seen:
-                    yield (_fragment_kind(frag.get("type")), frag["content"])
+                frag_kind = _fragment_kind(frag.get("type"))
+                if frag_kind and frag.get("content") and not snapshot_seen:
+                    yield (frag_kind, frag["content"])
             if fragments:
                 kind = _fragment_kind(fragments[-1].get("type"))
                 active_path = "response/fragments/-1/content"
@@ -527,7 +537,7 @@ def _parse_sse(lines, meta: Optional[dict] = None) -> Iterator[tuple]:
                     if not isinstance(frag, dict):
                         continue
                     kind = _fragment_kind(frag.get("type"))
-                    if frag.get("content"):
+                    if kind and frag.get("content"):
                         yield (kind, frag["content"])
                 continue
             # Content delta ("o" is APPEND, or absent right after a new fragment).

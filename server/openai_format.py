@@ -193,6 +193,10 @@ _REACT_PARSE = re.compile(
     re.IGNORECASE | re.DOTALL,
 )
 
+# A call written as a bare JSON object, with no wrapper: `{"name": ...`. Only
+# treated as an opener when the caller declared tool names to validate against.
+_BARE_CALL_OPEN = re.compile(r"""\{\s*["'\u201c\u201d\u2018\u2019]\s*name\s*["'\u201c\u201d\u2018\u2019]\s*:""")
+
 # Longest opener that could straddle a chunk boundary, held back before emitting.
 _TOOL_HOLD = max(len(o) for o in _TAG_OPENERS) + 12
 
@@ -507,8 +511,16 @@ class ToolCallExtractor:
     never mangled by it.
     """
 
-    def __init__(self, enabled: bool, strict: bool = False) -> None:
+    def __init__(self, enabled: bool, strict: bool = False,
+                 names: Optional[set] = None) -> None:
         self.enabled = enabled
+        # Declared tool names. Their presence enables bare-JSON openers, and
+        # they are what a bare call is validated against before it is accepted.
+        self.names = names or set()
+        self._bare = False
+        self._resolved = False
+        self._call: Optional[Tuple[str, str]] = None
+        self._cleaned: Optional[str] = None
         # `strict` recognises only the explicit tag openers, never ReAct.
         # Reasoning text is scanned in strict mode: deliberation routinely
         # writes lines like "Action: add the dependency", and treating those as
@@ -521,19 +533,24 @@ class ToolCallExtractor:
         self._opener = ""  # opener text, re-prepended if parsing fails
 
     def _find_opener(self, s: str):
-        """Earliest opener in `s` as (index, consumed_len, opener_text)."""
+        """Earliest opener in `s` as (index, consumed_len, opener_text, is_bare)."""
         best = None
         for op in _TAG_OPENERS:
             i = s.find(op)
             if i != -1 and (best is None or i < best[0]):
-                best = (i, len(op), op)
+                best = (i, len(op), op, False)
+        if self.names:
+            m = _BARE_CALL_OPEN.search(s)
+            if m and (best is None or m.start() < best[0]):
+                # Keep the "{" — the JSON parser needs it.
+                best = (m.start(), 0, "", True)
         if self.strict:
             return best
         m = _REACT_OPEN.search(s)
         if m and (best is None or m.start() < best[0]):
             # Keep "Action:" itself in the buffer — the ReAct parser needs it.
             lead = 1 if s[m.start()] == "\n" else 0
-            best = (m.start(), lead, "")
+            best = (m.start(), lead, "", False)
         return best
 
     def feed(self, chunk: str) -> str:
@@ -545,12 +562,13 @@ class ToolCallExtractor:
         self._pending += chunk
         found = self._find_opener(self._pending)
         if found:
-            i, consumed, opener = found
+            i, consumed, opener, is_bare = found
             out = self._pending[:i]
             self._buf = self._pending[i + consumed:]
             self._pending = ""
             self.active = True
             self._opener = opener
+            self._bare = is_bare
             return out.rstrip()
         cut = max(0, len(self._pending) - _TOOL_HOLD)
         out, self._pending = self._pending[:cut], self._pending[cut:]
@@ -561,22 +579,53 @@ class ToolCallExtractor:
         out, self._pending = self._pending, ""
         return out
 
+    def _resolve(self) -> None:
+        """Work out, once, what the buffer holds: a call, some text, or both."""
+        if self._resolved:
+            return
+        self._resolved = True
+        raw = self._buf.strip()
+        call = _parse_any_call(raw)
+        if call and self._bare and call[0] not in self.names:
+            # A bare `{"name": ...}` is only a call when it names a declared
+            # tool; otherwise it is ordinary JSON belonging to the text.
+            call = None
+        if self.names:
+            # Locate the call within the buffer so the text around it survives:
+            # a JSON-ish aside the model wrote before it, or a sentence after
+            # it. When the first parse already succeeded this just supplies the
+            # leftover; when it failed, it also recovers the call itself.
+            cleaned, found = find_bare_call(raw, self.names)
+            if found is not None:
+                self._cleaned = cleaned
+                if call is None:
+                    call = found
+        self._call = call
+
     def tool_call(self) -> Optional[Tuple[str, str]]:
         """The captured call as (name, arguments-JSON-string), if parseable."""
         if not self.active:
             return None
-        return _parse_any_call(self._buf.strip())
+        self._resolve()
+        return self._call
 
     def abandoned_text(self) -> str:
-        """What was swallowed after the opener, for when parsing fails.
+        """The buffered text that is NOT part of a call.
 
-        The content is handed back rather than dropped — losing a reply is
-        worse than showing an odd one — but the protocol tags are stripped so
+        Content is handed back rather than dropped — losing a reply is worse
+        than showing an odd one — but never the call itself: an empty string
+        means the buffer held nothing but markup. Protocol tags are stripped so
         the user sees the model's text, not our markers.
         """
         if not self.active:
             return ""
-        text = self._opener + self._buf
+        self._resolve()
+        if self._cleaned is not None:
+            text = self._cleaned
+        elif self._call is not None:
+            return ""  # the buffer is the call; showing it is the bug
+        else:
+            text = self._opener + self._buf
         for tag in _TAG_OPENERS + _TAG_CLOSERS:
             text = text.replace(tag, "")
         return text.strip()
@@ -592,12 +641,14 @@ def extract_tool_call(text: str, strict: bool = False,
     `known_names` enables the last-resort search for a call written as a bare
     JSON object with no wrapper at all (see `find_bare_call`).
     """
-    x = ToolCallExtractor(enabled=True, strict=strict)
+    x = ToolCallExtractor(enabled=True, strict=strict, names=known_names)
     plain = x.feed(text) + x.flush()
     call = x.tool_call()
     if x.active and call is None:  # unparseable: hand the raw text back
         plain = (plain + "\n" + x.abandoned_text()).strip()
     if call is None and known_names:
+        # Belt and braces: a bare call the opener scan missed (e.g. an unusual
+        # key order) can still be recovered from the assembled text.
         plain, call = find_bare_call(plain, known_names)
     return plain.rstrip(), call
 
@@ -721,13 +772,14 @@ def stream_chunks(
 
     # Tool extraction runs BEFORE the leak filter: tool arguments may embed
     # file contents with lines like "User: ..." that must not be cut.
-    tool = ToolCallExtractor(enabled=tools_enabled)
+    tool = ToolCallExtractor(enabled=tools_enabled, names=known_names)
     # With DeepThink on, the model sometimes ends its *reasoning* with the call
     # and never writes a reply, which would strand the turn: the call would be
     # rendered as thinking text and nothing would run. So reasoning is scanned
     # too — in strict mode, so ordinary deliberation is not mistaken for a call
     # — and that call is used only as a fallback (see below).
-    think_tool = ToolCallExtractor(enabled=tools_enabled, strict=True)
+    think_tool = ToolCallExtractor(enabled=tools_enabled, strict=True,
+                                   names=known_names)
     leak = RoleLeakFilter(enabled=strip_leak)
     collected = []
     reasoning_all = []
@@ -767,16 +819,19 @@ def stream_chunks(
                 yield frame({"reasoning_content": tail_think})
             if think_tool.active:
                 # A call was buffered, but a non-empty reply means it will not
-                # be used (see the fallback rule below), so its text is just
-                # reasoning — hand it back in place.
-                yield frame({"reasoning_content": think_tool.abandoned_text()})
+                # be used (see the fallback rule below). `abandoned_text` gives
+                # back the surrounding prose with the call removed, so nothing
+                # is lost and no markup is shown.
+                leftover = think_tool.abandoned_text()
+                if leftover:
+                    yield frame({"reasoning_content": leftover})
                 think_tool = ToolCallExtractor(enabled=False)  # spent
         yield from emit(tool.feed(d))
 
     call = tool.tool_call()
-    if tool.active and call is None:
-        # A sentinel appeared but never parsed: return the raw text instead of
-        # silently dropping the reply.
+    if tool.active:
+        # Whatever was buffered but is not the call — an unparseable sentinel,
+        # or prose the model wrote around the call — belongs in the reply.
         yield from emit(tool.abandoned_text())
     yield from emit(tool.flush())
     tail = leak.flush()
@@ -793,10 +848,13 @@ def stream_chunks(
     # while reasoning before a real answer must not be executed.
     if think_call and not call and not "".join(collected).strip():
         call = think_call
-    elif think_tool.active:
-        # Buffered while inspecting a call we are not running (unparseable, or
-        # parsed but not used). It is reasoning text — put it back.
-        yield frame({"reasoning_content": think_tool.abandoned_text()})
+    if think_tool.active:
+        # Whatever was buffered but is not the call — prose the model wrote
+        # around it — is reasoning text, whether or not the call gets used.
+        # `abandoned_text` never contains the call, so this is always safe.
+        leftover = think_tool.abandoned_text()
+        if leftover:
+            yield frame({"reasoning_content": leftover})
 
     if call is None and known_names:
         # Nothing matched a wrapper, so look for a call written as a bare JSON

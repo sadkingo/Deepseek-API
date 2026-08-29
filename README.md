@@ -295,15 +295,20 @@ Because it is prompt-level, expect these limits:
   strings** (which any file-writing tool hits, since its arguments carry source
   code), and a call written as a **bare JSON object with no wrapper at all** —
   accepted only when its `name` matches a tool the caller actually declared,
-  which is what keeps it from firing on example JSON. A call that fails to parse becomes visible junk in the user's
-  chat, so a call that still can't be parsed is returned as ordinary text
-  (protocol markers stripped) rather than dropped.
+  which is what keeps it from firing on example JSON. In every form the call is
+  removed from the visible reply while the prose around it is kept, so raw
+  protocol text never reaches the user. A call that still cannot be parsed is
+  returned as ordinary text (markers stripped) rather than dropped — losing a
+  reply is worse than showing an odd one.
 - **Streaming buffers the call.** Arguments must parse as a whole, so the
   `tool_calls` delta arrives in one frame at the end of the stream.
 - **A URL in the prompt changes the reply's shape.** DeepSeek then answers in a
   `READ_LINK` fragment instead of the usual `RESPONSE` one; the client treats
   both (and any future fragment type) as reply text, so a call is not lost or
-  cut in half when the answer spans them.
+  cut in half when the answer spans them. The one exception is `TIP`, the web
+  UI's own notice bar — e.g. "This response is AI-generated, for reference
+  only." on finance or health questions — which is dropped rather than appended
+  to the answer.
 - **Calls made inside DeepThink reasoning are rescued.** With thinking on, the
   model sometimes ends its reasoning with the call and writes no reply; that
   call is used (and removed from the reasoning) rather than left to stall the
