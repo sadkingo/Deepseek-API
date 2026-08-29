@@ -349,6 +349,77 @@ def _parse_any_call(raw: str) -> Optional[Tuple[str, str]]:
     return _parse_json_call(raw) or _parse_react_call(raw)
 
 
+def declared_tool_names(tools: Optional[List[dict]]) -> set:
+    """The set of function names the caller declared for this request."""
+    names = set()
+    for t in tools or []:
+        fn = t.get("function") if isinstance(t, dict) else None
+        if not isinstance(fn, dict):
+            fn = t if isinstance(t, dict) else {}
+        name = fn.get("name")
+        if isinstance(name, str) and name:
+            names.add(name)
+    return names
+
+
+def _json_span(text: str, start: int) -> Optional[int]:
+    """Index just past the balanced {...} beginning at `start`, or None.
+
+    Brace counting that tracks string literals, so braces and quotes inside a
+    string argument (file contents, regexes) do not end the object early. Raw
+    newlines inside strings are fine here — they are only a problem for the
+    JSON decoder, which runs afterwards on the span this returns.
+    """
+    depth = 0
+    in_string = False
+    escaped = False
+    for i in range(start, len(text)):
+        ch = text[i]
+        if in_string:
+            if escaped:
+                escaped = False
+            elif ch == "\\":
+                escaped = True
+            elif ch == '"':
+                in_string = False
+            continue
+        if ch == '"':
+            in_string = True
+        elif ch == "{":
+            depth += 1
+        elif ch == "}":
+            depth -= 1
+            if depth == 0:
+                return i + 1
+    return None
+
+
+def find_bare_call(text: str, names: set) -> Tuple[str, Optional[Tuple[str, str]]]:
+    """Find a call written as a bare JSON object, with no wrapper tags.
+
+    The model sometimes drops the <function_call> markers and simply writes
+    {"name": ..., "arguments": {...}}. There is no opener to detect, so instead
+    every JSON object in the text is parsed and accepted only when its `name`
+    is one of the tools the caller actually declared. That check is what keeps
+    this from firing on example JSON or on a JSON file being written.
+
+    Returns the text with the call removed, and the call.
+    """
+    if not names or not text or "{" not in text:
+        return text, None
+    for i, ch in enumerate(text):
+        if ch != "{":
+            continue
+        end = _json_span(text, i)
+        if end is None:
+            continue
+        call = _parse_json_call(text[i:end])
+        if call and call[0] in names:
+            cleaned = (text[:i].rstrip() + "\n" + text[end:].lstrip()).strip()
+            return cleaned, call
+    return text, None
+
+
 def serialize_tool_call(name: str, arguments: str) -> str:
     """The in-prompt text form of a tool call.
 
@@ -381,6 +452,8 @@ def tools_preamble(tools: List[dict]) -> str:
         '<function_call>{"name": "list_directory", "arguments": '
         '{"path": "."}}</function_call>\n\n'
         "Rules:\n"
+        "- The <function_call> and </function_call> markers are REQUIRED. A bare "
+        "JSON object on its own is not a call and will not run.\n"
         "- Use ONLY this format. Do NOT write 'Action:', 'Action Input:', "
         "'Thought:', 'Observation:', ```json blocks, or any other tool syntax "
         "— those are not understood and the tool will not run.\n"
@@ -509,18 +582,23 @@ class ToolCallExtractor:
         return text.strip()
 
 
-def extract_tool_call(text: str,
-                      strict: bool = False) -> Tuple[str, Optional[Tuple[str, str]]]:
+def extract_tool_call(text: str, strict: bool = False,
+                      known_names: Optional[set] = None
+                      ) -> Tuple[str, Optional[Tuple[str, str]]]:
     """Non-streaming form: split `text` into (plain text, parsed call or None).
 
     `strict` recognises only explicit tag openers — use it for reasoning text,
     where a line like "Action: add the dependency" is deliberation, not a call.
+    `known_names` enables the last-resort search for a call written as a bare
+    JSON object with no wrapper at all (see `find_bare_call`).
     """
     x = ToolCallExtractor(enabled=True, strict=strict)
     plain = x.feed(text) + x.flush()
     call = x.tool_call()
     if x.active and call is None:  # unparseable: hand the raw text back
         plain = (plain + "\n" + x.abandoned_text()).strip()
+    if call is None and known_names:
+        plain, call = find_bare_call(plain, known_names)
     return plain.rstrip(), call
 
 
@@ -610,6 +688,7 @@ def stream_chunks(
     on_done: Optional[Callable[[str, Optional[str]], None]] = None,
     strip_leak: bool = True,
     tools_enabled: bool = False,
+    known_names: Optional[set] = None,
 ) -> Iterable[str]:
     """Yield OpenAI SSE lines (`data: {...}\\n\\n`) for a streamed completion.
 
@@ -651,6 +730,7 @@ def stream_chunks(
     think_tool = ToolCallExtractor(enabled=tools_enabled, strict=True)
     leak = RoleLeakFilter(enabled=strip_leak)
     collected = []
+    reasoning_all = []
     saw_reasoning = False
     reasoning_closed = False
 
@@ -671,6 +751,7 @@ def stream_chunks(
             # Reasoning is a separate channel: no leak filtering, and it never
             # counts as reply text.
             saw_reasoning = True
+            reasoning_all.append(d)
             safe = think_tool.feed(d)
             if safe:
                 yield frame({"reasoning_content": safe})
@@ -716,6 +797,19 @@ def stream_chunks(
         # Buffered while inspecting a call we are not running (unparseable, or
         # parsed but not used). It is reasoning text — put it back.
         yield frame({"reasoning_content": think_tool.abandoned_text()})
+
+    if call is None and known_names:
+        # Nothing matched a wrapper, so look for a call written as a bare JSON
+        # object. This runs after the text has streamed rather than buffering
+        # for it: a write_file argument can be hundreds of lines, and holding
+        # that back to find out whether it is a call would stall the reply and
+        # reorder it. The call still reaches the client, which is what unsticks
+        # the turn; the JSON may also remain visible in the text.
+        reply_text = "".join(collected)
+        _, call = find_bare_call(reply_text, known_names)
+        if call is None and not reply_text.strip():
+            # Same rule as the reasoning fallback above: only when no reply.
+            _, call = find_bare_call("".join(reasoning_all), known_names)
 
     conversation_id = getattr(stream, "conversation_id", None)
     if not call and not "".join(collected).strip():

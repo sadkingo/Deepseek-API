@@ -1,0 +1,17 @@
+#!/usr/bin/env bash
+# Start the OpenAI-compatible DeepSeek server in the foreground (Ctrl-C stops it).
+#
+# Runs the venv's interpreter directly instead of activating the venv: the
+# effect is identical for this process and it leaves the caller's shell alone.
+set -euo pipefail
+
+cd "$(dirname "$(readlink -f "$0")")/.."
+
+if [ ! -x venv/bin/python ]; then
+    echo "No virtualenv at $(pwd)/venv — create it first:" >&2
+    echo "  python3 -m venv venv && venv/bin/pip install -r requirements.txt" >&2
+    exit 1
+fi
+
+echo "Starting DeepSeek API server (Ctrl-C to stop)…"
+exec venv/bin/python app.py "$@"

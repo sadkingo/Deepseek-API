@@ -1,0 +1,26 @@
+#!/usr/bin/env bash
+# Expose the local server over a public HTTPS URL via a Cloudflare quick tunnel.
+#
+# Run this in a second terminal, with the server already started. The printed
+# https://<random>.trycloudflare.com address is the API base + /v1, and it
+# changes every time the tunnel restarts.
+set -euo pipefail
+
+CLOUDFLARED="${CLOUDFLARED:-$HOME/cloudflared}"
+PORT="${PORT:-8000}"
+
+if [ ! -x "$CLOUDFLARED" ]; then
+    echo "cloudflared not found at $CLOUDFLARED" >&2
+    echo "Set CLOUDFLARED=/path/to/cloudflared, or download it from" >&2
+    echo "  https://developers.cloudflare.com/cloudflare-one/connections/connect-networks/downloads/" >&2
+    exit 1
+fi
+
+# A tunnel to a port nothing is listening on produces a URL that 502s, which
+# looks like a tunnel bug rather than a server that was never started.
+if ! curl -fsS -m 3 "http://localhost:$PORT/healthz" >/dev/null 2>&1; then
+    echo "Warning: nothing is answering on http://localhost:$PORT — start the" >&2
+    echo "server first (run: start), or the tunnel URL will return errors." >&2
+fi
+
+exec "$CLOUDFLARED" tunnel --url "http://localhost:$PORT" "$@"

@@ -50,6 +50,7 @@ from .config import (
 )
 from .openai_format import (
     completion_response,
+    declared_tool_names,
     extract_tool_call,
     message_images,
     message_texts,
@@ -288,6 +289,7 @@ async def chat_completions(req: ChatCompletionRequest):
                     req.model, stream,
                     on_done=lambda t, c: remember(t, c, streamed=True),
                     tools_enabled=bool(req.tools),
+                    known_names=declared_tool_names(req.tools),
                 )
             except Exception as e:
                 # Headers are already sent, so the failure has to travel as an
@@ -317,13 +319,15 @@ async def chat_completions(req: ChatCompletionRequest):
     text = reply.text
     reasoning = reply.thinking
     if req.tools:
-        text, tool_call = extract_tool_call(text)
+        names = declared_tool_names(req.tools)
+        text, tool_call = extract_tool_call(text, known_names=names)
         if reasoning and not tool_call and not text.strip():
             # With DeepThink on, the model sometimes ends its reasoning with the
             # call and writes no reply. Only rescue it when the reply really is
             # empty, so a call merely mentioned mid-thought is never run — and
             # in that case leave `reasoning` untouched so none of it is lost.
-            reasoning_text, think_call = extract_tool_call(reasoning, strict=True)
+            reasoning_text, think_call = extract_tool_call(
+                reasoning, strict=True, known_names=names)
             if think_call:
                 tool_call, reasoning = think_call, reasoning_text
     text = strip_role_leak(text)

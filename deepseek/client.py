@@ -433,9 +433,22 @@ class _Stream:
         return _encode_cid(self._session_id, self._message_id)
 
 
-# Fragment types we surface, mapped to the event kind callers see. Other types
-# (e.g. search-result fragments) are metadata, not reply text, and are skipped.
-_FRAGMENT_KINDS = {"THINK": "thinking", "RESPONSE": "text"}
+# Fragment types, mapped to the event kind callers see.
+#
+# "READ_LINK" appears whenever the prompt mentions a URL: DeepSeek switches to a
+# link-reading mode and puts the WHOLE reply in that fragment — prose and all —
+# sometimes without ever emitting a RESPONSE fragment. Treating it as anything
+# but reply text silently loses the answer, or truncates one that spans both.
+#
+# Unknown types therefore default to text as well: DeepSeek adds fragment kinds
+# over time, and dropping an unrecognised one costs the user their reply, while
+# including it at worst adds some stray text we can see and fix.
+_FRAGMENT_KINDS = {"THINK": "thinking", "RESPONSE": "text", "READ_LINK": "text"}
+_DEFAULT_FRAGMENT_KIND = "text"
+
+
+def _fragment_kind(frag_type) -> str:
+    return _FRAGMENT_KINDS.get(frag_type, _DEFAULT_FRAGMENT_KIND)
 
 
 def _parse_sse(lines, meta: Optional[dict] = None) -> Iterator[tuple]:
@@ -493,11 +506,10 @@ def _parse_sse(lines, meta: Optional[dict] = None) -> Iterator[tuple]:
                 _capture_message_id(meta, v)
             fragments = v["response"].get("fragments", [])
             for frag in fragments:
-                frag_kind = _FRAGMENT_KINDS.get(frag.get("type"))
-                if frag_kind and frag.get("content") and not snapshot_seen:
-                    yield (frag_kind, frag["content"])
+                if frag.get("content") and not snapshot_seen:
+                    yield (_fragment_kind(frag.get("type")), frag["content"])
             if fragments:
-                kind = _FRAGMENT_KINDS.get(fragments[-1].get("type"))
+                kind = _fragment_kind(fragments[-1].get("type"))
                 active_path = "response/fragments/-1/content"
             snapshot_seen = True
             continue
@@ -514,10 +526,9 @@ def _parse_sse(lines, meta: Optional[dict] = None) -> Iterator[tuple]:
                 for frag in v:
                     if not isinstance(frag, dict):
                         continue
-                    frag_kind = _FRAGMENT_KINDS.get(frag.get("type"))
-                    if frag_kind and frag.get("content"):
-                        yield (frag_kind, frag["content"])
-                    kind = frag_kind
+                    kind = _fragment_kind(frag.get("type"))
+                    if frag.get("content"):
+                        yield (kind, frag["content"])
                 continue
             # Content delta ("o" is APPEND, or absent right after a new fragment).
             if obj.get("o") in (None, "APPEND") and isinstance(v, str) \

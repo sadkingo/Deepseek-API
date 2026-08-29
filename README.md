@@ -291,13 +291,19 @@ Because it is prompt-level, expect these limits:
 - **Reliability is the model's, not the protocol's.** The parser is
   deliberately liberal — it also accepts ReAct (`Action:` / `Action Input:`),
   `<tool_call>` tags, fenced JSON, curly quotes, single quotes, trailing
-  commas, Python `True`/`None` literals, and **raw newlines and tabs inside
-  JSON strings** (which any file-writing tool hits, since its arguments carry
-  source code). A call that fails to parse becomes visible junk in the user's
+  commas, Python `True`/`None` literals, **raw newlines and tabs inside JSON
+  strings** (which any file-writing tool hits, since its arguments carry source
+  code), and a call written as a **bare JSON object with no wrapper at all** —
+  accepted only when its `name` matches a tool the caller actually declared,
+  which is what keeps it from firing on example JSON. A call that fails to parse becomes visible junk in the user's
   chat, so a call that still can't be parsed is returned as ordinary text
   (protocol markers stripped) rather than dropped.
 - **Streaming buffers the call.** Arguments must parse as a whole, so the
   `tool_calls` delta arrives in one frame at the end of the stream.
+- **A URL in the prompt changes the reply's shape.** DeepSeek then answers in a
+  `READ_LINK` fragment instead of the usual `RESPONSE` one; the client treats
+  both (and any future fragment type) as reply text, so a call is not lost or
+  cut in half when the answer spans them.
 - **Calls made inside DeepThink reasoning are rescued.** With thinking on, the
   model sometimes ends its reasoning with the call and writes no reply; that
   call is used (and removed from the reasoning) rather than left to stall the
