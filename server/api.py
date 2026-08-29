@@ -45,14 +45,19 @@ from .config import (
     RATE_LIMIT_PER_MINUTE,
     SERVER_INTERACTIVE_LOGIN,
     is_known_model,
+    model_thinking,
     resolve_model_type,
 )
 from .openai_format import (
     completion_response,
+    extract_tool_call,
+    message_images,
     message_texts,
     messages_to_prompt,
+    serialize_tool_call,
     stream_chunks,
     strip_role_leak,
+    tools_preamble,
 )
 from .threads import ThreadCache, history_key
 from .ratelimit import RateLimiter, install_rate_limit
@@ -216,12 +221,23 @@ async def chat_completions(req: ChatCompletionRequest):
         # Resuming: send only the new turn. That is the last message with text,
         # skipping any trailing empty or non-text (e.g. image-only) entries.
         prompt = next((t for _, t in reversed(history) if t.strip()), "")
+        # Images from earlier turns were already attached when those turns were
+        # sent, so on resume only the newest message's images are uploaded.
+        images = message_images(req.messages[-1:])
     else:
         prompt = messages_to_prompt(req.messages)
+        images = message_images(req.messages)
+        # New thread with tools: teach the model the emulated tool-call
+        # protocol. It goes LAST, after the client's own (often long) system
+        # prompt — buried at the top it loses out to whatever tool syntax that
+        # prompt implies, and the model falls back to ReAct. On resume the
+        # thread already carries it.
+        if req.tools:
+            prompt = f"{prompt}\n\n{tools_preamble(req.tools)}"
 
-    if not prompt.strip():
+    if not prompt.strip() and not images:
         return _error(
-            "No text content in `messages` to send.",
+            "No text or image content in `messages` to send.",
             status=400, err_type="invalid_request_error",
         )
 
@@ -230,6 +246,11 @@ async def chat_completions(req: ChatCompletionRequest):
     # A thread's model is fixed when it's created, so on resume we ignore `model`
     # (the OpenAI SDK always sends one) and let the existing thread's model stand.
     model_type = None if conversation_id else resolve_model_type(req.model)
+
+    # DeepThink: on when the request asks for it OR the model id bakes it in
+    # ("-reasoner" ids exist for frontends that can only vary the model name).
+    # Unlike the model, thinking is per-message, so it applies on resume too.
+    thinking = req.thinking or model_thinking(req.model)
 
     def remember(reply_text: str, cid: str | None, streamed: bool = False) -> None:
         """Record the thread so the client's next resend resumes it."""
@@ -246,16 +267,27 @@ async def chat_completions(req: ChatCompletionRequest):
     except Exception as e:  # session/login failure
         return _error(f"Failed to initialise DeepSeek session: {e}")
 
+    def upload_images() -> list:
+        """Upload the request's images to DeepSeek, returning their file ids.
+
+        Blocking (upload + parse-poll per image), so it must run off the event
+        loop — inside the stream generator or via run_in_threadpool.
+        """
+        return [client.upload_file(data, filename, mime)
+                for filename, mime, data in images]
+
     if req.stream:
         def gen():
             try:
                 stream = client.stream(
                     prompt, conversation_id=conversation_id,
-                    model=model_type, thinking=req.thinking, search=req.search,
+                    model=model_type, thinking=thinking, search=req.search,
+                    ref_file_ids=upload_images(),
                 )
                 yield from stream_chunks(
                     req.model, stream,
                     on_done=lambda t, c: remember(t, c, streamed=True),
+                    tools_enabled=bool(req.tools),
                 )
             except Exception as e:
                 # Headers are already sent, so the failure has to travel as an
@@ -268,16 +300,55 @@ async def chat_completions(req: ChatCompletionRequest):
 
         return StreamingResponse(gen(), media_type="text/event-stream")
 
+    def run_chat():
+        return client.chat(prompt, conversation_id, model_type,
+                           thinking, req.search, upload_images())
+
     try:
-        reply = await run_in_threadpool(
-            client.chat, prompt, conversation_id,
-            model_type, req.thinking, req.search,
-        )
+        reply = await run_in_threadpool(run_chat)
     except ServerBusy as e:
         return _error(str(e), status=503, err_type="overloaded_error")
     except Exception as e:
         return _error(f"DeepSeek request failed: {e}")
 
-    text = strip_role_leak(reply.text)
-    remember(text, reply.conversation_id)
-    return completion_response(req.model, text, prompt, reply.conversation_id)
+    # Split off an emulated tool call before leak-stripping: tool arguments may
+    # embed file contents whose lines would otherwise look like a leaked turn.
+    tool_call = None
+    text = reply.text
+    reasoning = reply.thinking
+    if req.tools:
+        text, tool_call = extract_tool_call(text)
+        if reasoning and not tool_call and not text.strip():
+            # With DeepThink on, the model sometimes ends its reasoning with the
+            # call and writes no reply. Only rescue it when the reply really is
+            # empty, so a call merely mentioned mid-thought is never run — and
+            # in that case leave `reasoning` untouched so none of it is lost.
+            reasoning_text, think_call = extract_tool_call(reasoning, strict=True)
+            if think_call:
+                tool_call, reasoning = think_call, reasoning_text
+    text = strip_role_leak(text)
+
+    if not text.strip() and not tool_call:
+        # Nothing actionable came back. Either DeepSeek said nothing at all
+        # (how it answers while throttling the account — the reply returns
+        # almost instantly), or it reasoned and then stopped without writing a
+        # reply. Both leave the caller with a turn it cannot act on, so report
+        # a retryable error rather than a blank message that stalls an agent.
+        return _error(
+            "DeepSeek returned no reply"
+            f"{' (it produced only reasoning)' if reasoning else ''}. This is "
+            "usually transient, or the account being throttled for sending too "
+            "many requests; wait a moment and retry.",
+            status=503, err_type="overloaded_error",
+        )
+
+    if tool_call:
+        # Record the reply in its protocol text form, matching what the client
+        # resends as an assistant message carrying tool_calls.
+        call_text = serialize_tool_call(*tool_call)
+        remembered = f"{text}\n{call_text}".strip() if text else call_text
+    else:
+        remembered = text
+    remember(remembered, reply.conversation_id)
+    return completion_response(req.model, text, prompt, reply.conversation_id,
+                               reasoning=reasoning, tool_call=tool_call)

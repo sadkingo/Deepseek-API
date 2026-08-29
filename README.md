@@ -23,6 +23,9 @@ You sign in once in a browser with your DeepSeek account; your session is saved 
 - [Command line](#command-line)
 - [Human-check & proof-of-work (automatic)](#human-check--proof-of-work-automatic)
 - [Models, DeepThink & web search](#models-deepthink--web-search)
+- [Images (vision)](#images-vision)
+- [Tool calling](#tool-calling)
+- [Using it from Zed](#using-it-from-zed)
 - [Concurrency](#concurrency)
 - [Rate limiting](#rate-limiting)
 - [Project layout](#project-layout)
@@ -156,7 +159,7 @@ curl http://localhost:8000/v1/chat/completions \
 
 | Method | Path | Description |
 | --- | --- | --- |
-| `POST` | `/v1/chat/completions` | Chat (supports `"stream": true`, plus optional `"conversation_id"`, `"thinking"`, `"search"`) |
+| `POST` | `/v1/chat/completions` | Chat (supports `"stream": true`, `"tools"`, and images, plus optional `"conversation_id"`, `"thinking"`, `"search"`) |
 | `GET`  | `/v1/models` | Lists the available models |
 | `GET`  | `/healthz` | Health check (rate-limit exempt) |
 
@@ -194,16 +197,19 @@ Chrome profile when possible; only a full expiry sends you back to the browser.
 
 ## Models, DeepThink & web search
 
-The `model` name selects **which model** answers. DeepThink and web search are
-**not** models — they're orthogonal toggles you pass per request.
+The `model` name selects **which model** answers, and the `-reasoner` ids also
+turn on DeepThink for clients that can only pick a model name:
 
-| Model | DeepSeek mode | Notes |
-| --- | --- | --- |
-| `deepseek-chat` | Instant | Fast default model |
-| `deepseek-expert` | Expert | Stronger, slower |
+| Model | DeepSeek mode | DeepThink | Notes |
+| --- | --- | --- | --- |
+| `deepseek-chat` | Instant | off | Fast default model |
+| `deepseek-expert` | Expert | off | Stronger, slower |
+| `deepseek-reasoner` | Instant | on | Reasoning streamed as `reasoning_content` |
+| `deepseek-expert-reasoner` | Expert | on | Reasoning streamed as `reasoning_content` |
 
-Pass `thinking: true` (DeepThink reasoning) and/or `search: true` (web search) in
-the request body — or via the OpenAI SDK's `extra_body`:
+DeepThink and web search can also be toggled per request, on any model, with
+`thinking: true` / `search: true` in the request body — or via the OpenAI SDK's
+`extra_body`:
 
 ```python
 resp = client.chat.completions.create(
@@ -213,10 +219,161 @@ resp = client.chat.completions.create(
 )
 ```
 
+With DeepThink on, the reasoning arrives separately from the reply — streamed
+as `delta.reasoning_content` chunks and attached as `message.reasoning_content`
+on non-streamed responses, matching the official DeepSeek API — so the reply
+text stays clean.
+
 `conversation_id`, `thinking`, and `search` are non-OpenAI extras. A thread's
 model is fixed at creation, so `model` can't be combined with `conversation_id`
 on resume. Unknown model names return a `404` (no silent fallback). See
 [server/config.py](server/config.py).
+
+---
+
+## Images (vision)
+
+Send images the standard OpenAI vision way — as base64 **data URIs** inside a
+message's content parts:
+
+```python
+resp = client.chat.completions.create(
+    model="deepseek-chat",
+    messages=[{
+        "role": "user",
+        "content": [
+            {"type": "text", "text": "What's in this image?"},
+            {"type": "image_url",
+             "image_url": {"url": f"data:image/png;base64,{b64}"}},
+        ],
+    }],
+)
+```
+
+Each image is uploaded to DeepSeek, waited on until parsed, and attached to the
+message (`ref_file_ids`). Only data URIs are read — plain `http(s)` image URLs
+are ignored, since the server won't fetch arbitrary URLs on a caller's behalf.
+
+---
+
+## Tool calling
+
+OpenAI-style function calling works, but it is **emulated** — DeepSeek's web
+chat has no tool-call channel, so the server bridges it in the prompt:
+
+1. Your `tools` schemas are injected as a protocol preamble on the first turn.
+2. The model replies with `<function_call>{"name": ..., "arguments": {...}}`.
+3. The server parses that out and returns a normal OpenAI `tool_calls` response
+   with `finish_reason: "tool_calls"` — the markers never reach your client.
+4. You send the result back as a `role: "tool"` message; it reaches the model
+   wrapped in `<function_result>` markers.
+
+```python
+resp = client.chat.completions.create(
+    model="deepseek-chat",
+    messages=[{"role": "user", "content": "What's the weather in Paris?"}],
+    tools=[{"type": "function", "function": {
+        "name": "get_weather",
+        "description": "Get the current weather for a city.",
+        "parameters": {"type": "object",
+                       "properties": {"city": {"type": "string"}},
+                       "required": ["city"]}}}],
+)
+resp.choices[0].message.tool_calls  # -> [ChatCompletionMessageToolCall(...)]
+```
+
+Because it is prompt-level, expect these limits:
+
+- **One call per reply.** Parallel tool calls aren't supported; keep
+  `parallel_tool_calls: false`.
+- **`tool_choice` is accepted but not enforced** — the model decides, so it may
+  answer directly when you demanded a call.
+- **Reliability is the model's, not the protocol's.** The parser is
+  deliberately liberal — it also accepts ReAct (`Action:` / `Action Input:`),
+  `<tool_call>` tags, fenced JSON, curly quotes, single quotes, trailing
+  commas, Python `True`/`None` literals, and **raw newlines and tabs inside
+  JSON strings** (which any file-writing tool hits, since its arguments carry
+  source code). A call that fails to parse becomes visible junk in the user's
+  chat, so a call that still can't be parsed is returned as ordinary text
+  (protocol markers stripped) rather than dropped.
+- **Streaming buffers the call.** Arguments must parse as a whole, so the
+  `tool_calls` delta arrives in one frame at the end of the stream.
+- **Calls made inside DeepThink reasoning are rescued.** With thinking on, the
+  model sometimes ends its reasoning with the call and writes no reply; that
+  call is used (and removed from the reasoning) rather than left to stall the
+  turn — but only when the reply is otherwise empty, so a call merely
+  *mentioned* mid-thought is never executed.
+
+---
+
+## Using it from Zed
+
+Add the server as an OpenAI-compatible provider in Zed's `settings.json`
+(`zed: open settings`), then pick the models in the Agent panel. Zed shows
+DeepThink reasoning in a collapsible "Thinking" block (`interleaved_reasoning`)
+and lets you attach images (`images`):
+
+```json
+{
+  "language_models": {
+    "openai_compatible": {
+      "DeepSeek Local": {
+        "api_url": "http://localhost:8000/v1",
+        "available_models": [
+          {
+            "name": "deepseek-chat",
+            "display_name": "DeepSeek Chat",
+            "max_tokens": 128000,
+            "max_output_tokens": 32000,
+            "capabilities": {
+              "tools": true,
+              "images": true,
+              "parallel_tool_calls": false,
+              "prompt_cache_key": false,
+              "chat_completions": true,
+              "interleaved_reasoning": false,
+              "max_tokens_parameter": false
+            }
+          },
+          {
+            "name": "deepseek-reasoner",
+            "display_name": "DeepSeek Thinking",
+            "max_tokens": 128000,
+            "max_output_tokens": 32000,
+            "reasoning_effort": "medium",
+            "capabilities": {
+              "tools": true,
+              "images": true,
+              "parallel_tool_calls": false,
+              "prompt_cache_key": false,
+              "chat_completions": true,
+              "interleaved_reasoning": true,
+              "max_tokens_parameter": false
+            }
+          }
+        ]
+      }
+    }
+  }
+}
+```
+
+Repeat the two entries with `deepseek-expert` / `deepseek-expert-reasoner`
+(`max_tokens: 36000` — the Expert model rejects prompts above ~160k
+*characters*, which is ~36k tokens of ordinary English at ~4.4 chars/token)
+for the Expert variants. The Instant model has no such practical limit
+(verified with full recall past 2M characters), so `128000` — the model's
+official context window — is safe, and you can raise it if you want Zed to
+compact later.
+
+> If you see an "empty response … most likely too long" error at a size well
+> under these limits, it is **not** a length problem — that message was wrong
+> in older versions. See [upstream throttling](#upstream-throttling-503-overloaded_error).
+
+`"tools": true` lets Zed use the models agentically (reading and editing files,
+running commands) — see [Tool calling](#tool-calling) for how that is emulated
+and its limits. Zed asks for an API key the first time: enter anything
+(e.g. `ok`) — the server doesn't check it.
 
 ---
 
@@ -251,6 +408,23 @@ retry with growing delays (e.g. 1s, 2s, 4s). The official `openai` SDK does this
 automatically and honours `Retry-After`; with plain HTTP, add a few retries
 yourself.
 
+### Upstream throttling (`503 overloaded_error`)
+
+Separately from this server's own limit, **DeepSeek throttles the account** when
+you send a lot of requests in a short span. It does this by accepting the
+request and returning an empty reply almost instantly.
+
+Because that costs the account nothing and usually clears at once, the client
+**retries such a request once** (after `DEEPSEEK_EMPTY_RETRY_DELAY`, default 2s)
+before giving up — nothing has been emitted at that point, so no output can be
+duplicated. If the retry is empty too, the server returns a
+`503 overloaded_error` telling you to retry, rather than handing your client a
+blank message that would stall an agent.
+
+If you see it repeatedly, slow down — the account is being rate limited, and
+hammering it harder is what gets a DeepSeek account muted. Waiting a minute or
+two clears it.
+
 ---
 
 ## Project layout
@@ -269,8 +443,9 @@ yourself.
 - **Sign in once, then reuse.** The cached session refreshes automatically; you only re-sign-in if it fully expires.
 - **Be reasonable.** Please use it in moderation, and don't spam or hammer it with automated bulk requests.
 - **No real token counts.** `usage` in responses is a rough ~4-chars/token estimate.
-- **Most OpenAI params are accepted but ignored** (`temperature`, `top_p`, `max_tokens`); only `model`, `messages`, `stream`, `conversation_id`, `thinking`, and `search` do anything.
-- **Vision is deferred.** It needs image-upload plumbing that isn't built yet.
+- **Most OpenAI params are accepted but ignored** (`temperature`, `top_p`, `max_tokens`, `tool_choice`); only `model`, `messages`, `stream`, `tools`, `conversation_id`, `thinking`, and `search` do anything.
+- **Tool calling is emulated in the prompt** (see [Tool calling](#tool-calling)): one call per reply, and no `tool_choice` enforcement.
+- **Images must be data URIs.** Vision works (see [Images](#images-vision)), but only base64 `data:` URLs are read; `http(s)` image links are ignored.
 - **Your session is private.** Everything in `session/` (cookies + token) stays on your machine and is git-ignored.
 
 ## License

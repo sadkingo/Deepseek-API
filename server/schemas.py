@@ -11,9 +11,14 @@ from .config import DEFAULT_MODEL
 
 class ChatMessage(BaseModel):
     role: str
-    # content is a plain string, or a list of parts (OpenAI vision-style). We only
-    # read text parts; non-text parts are ignored.
+    # content is a plain string, or a list of parts (OpenAI vision-style): text
+    # parts and data-URI image parts are read; other parts are ignored.
     content: Union[str, List[dict], None] = None
+    # OpenAI function-calling fields: an assistant message may carry tool_calls,
+    # and a role="tool" message carries the result for tool_call_id.
+    tool_calls: Optional[List[dict]] = None
+    tool_call_id: Optional[str] = None
+    name: Optional[str] = None
 
 
 class ChatCompletionRequest(BaseModel):
@@ -26,6 +31,12 @@ class ChatCompletionRequest(BaseModel):
     # pass these via extra_body: `thinking` (DeepThink), `search` (web).
     thinking: bool = False
     search: bool = False
+    # OpenAI function tools. DeepSeek's web API has no native tool-call channel,
+    # so these are emulated: the schemas are injected into the prompt and the
+    # model's <function_call> output is parsed back into OpenAI tool_calls.
+    tools: Optional[List[dict]] = None
+    tool_choice: Optional[Union[str, dict]] = None  # accepted, not enforced
+    parallel_tool_calls: Optional[bool] = None      # always effectively False
     # Accepted for compatibility but not all are forwarded to DeepSeek.
     temperature: Optional[float] = None
     top_p: Optional[float] = None

@@ -20,17 +20,20 @@ SERVER_INTERACTIVE_LOGIN = os.getenv("SERVER_INTERACTIVE_LOGIN", "1").lower() no
     "0", "false", "no", "off",
 )
 
-# Public model ids the server advertises (via /v1/models) and accepts, mapped to
-# DeepSeek's `model_type` wire value. This is the MODEL axis ONLY — it picks
-# which model answers. DeepThink and web Search are orthogonal tools requested
-# per call via `tool_names` (see deepseek.client.KNOWN_TOOLS), never encoded in
-# the model name.
-#
-# "vision" is deferred: it only does anything with an image attached, which needs
-# ref_file_ids / file-upload plumbing we don't have yet.
+# Public model ids the server advertises (via /v1/models) and accepts, mapped
+# to DeepSeek's `model_type` wire value plus whether DeepThink is on. Thinking
+# is really a per-request tool (the `thinking` extra-body flag still works and
+# ORs with this), but most OpenAI-compatible frontends (Zed, etc.) can only
+# vary the model name — so the "-reasoner" ids bake it in, mirroring the
+# official API's deepseek-chat / deepseek-reasoner naming.
 MODEL_MAP = {
-    "deepseek-chat":   "default",   # Instant — the fast default model
-    "deepseek-expert": "expert",    # Expert  — the stronger, slower model
+    # Instant — the fast default model
+    "deepseek-chat":            {"model_type": "default", "thinking": False},
+    # Expert — the stronger, slower model
+    "deepseek-expert":          {"model_type": "expert",  "thinking": False},
+    # Same models with DeepThink reasoning enabled
+    "deepseek-reasoner":        {"model_type": "default", "thinking": True},
+    "deepseek-expert-reasoner": {"model_type": "expert",  "thinking": True},
 }
 
 DEFAULT_MODEL = "deepseek-chat"
@@ -46,7 +49,12 @@ def resolve_model_type(name: str) -> str:
 
     Caller must check `is_known_model` first; this raises KeyError otherwise.
     """
-    return MODEL_MAP[name]
+    return MODEL_MAP[name]["model_type"]
+
+
+def model_thinking(name: str) -> bool:
+    """Whether the model id has DeepThink reasoning baked in."""
+    return MODEL_MAP[name]["thinking"]
 
 
 # Extra names accepted for a model, for frontends with a fixed model list of
