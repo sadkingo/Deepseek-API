@@ -510,6 +510,18 @@ This is deliberately loose about everything frontends rewrite between turns:
 - **"Continue" continues.** When the client resends our own last reply with
   nothing after it, the thread is resumed with an instruction to carry on,
   rather than being handed its own words as a new message.
+- **Regenerating or editing a thread's first turn stays in that chat.** The
+  first turn of a thread has no earlier state to resume — the thread began
+  with it — so the whole prompt has to go again. It goes into the *same*
+  DeepSeek chat as a new branch from the root (a bare session id), not into
+  yet another chat, provided the history before it agrees with what that
+  thread remembers. This is the common case right after a restart with an
+  empty index or a freshly registered account: the first turn opens the chat,
+  and every swipe or edit of it stays there.
+- **A replaced account's threads are never tried.** Every recorded turn is
+  tagged with the signed-in account; after a muted account is swapped for a
+  fresh one, the dead threads are skipped and pruned instead of each costing
+  a failed resume.
 
 Each lookup writes a `~~ thread:` line to the request log saying what matched
 and on what evidence. The index is saved to `session/threads.json`

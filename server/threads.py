@@ -128,6 +128,9 @@ class Turn:
     #   alignable messages that were flattened into the first prompt, oldest
     #   first, so the history before a root can still be checked
     ts: float = 0.0
+    account: str = ""          # which DeepSeek account owns the session: a
+    #   thread from a previous (muted, replaced) account is dead and never
+    #   worth a request
 
     @property
     def session(self) -> str:
@@ -145,9 +148,18 @@ class Match:
     exhaustive: bool   # thread root and history start met: nothing unchecked
     continues: bool = False  # the client resent this state's own reply last:
     #   it wants that reply continued, not answered
+    sibling: bool = False    # `cid` is a bare session id: the turn is a
+    #   regeneration or edit of a thread's FIRST turn, whose earlier state we
+    #   never had, so it is re-sent in full as a new branch of the same chat
+    #   rather than as yet another chat
 
     def describe(self) -> str:
-        why = [f"{self.depth} turn{'s' if self.depth != 1 else ''} aligned"]
+        if self.sibling:
+            why = ["regenerated or edited first turn: new branch of the same chat"]
+            if self.depth:
+                why.append(f"{self.depth} earlier message{'s' if self.depth != 1 else ''} agree")
+        else:
+            why = [f"{self.depth} turn{'s' if self.depth != 1 else ''} aligned"]
         if self.continues:
             why.append("continue the reply")
         if self.exhaustive:
@@ -171,6 +183,9 @@ class TurnIndex:
     def __init__(self, max_turns: int = 2048, path: Optional[str] = None) -> None:
         self._turns: "OrderedDict[str, Turn]" = OrderedDict()  # cid -> Turn, oldest first
         self._by_first: Dict[str, Set[str]] = {}               # first-line hash -> cids
+        # Roots by the hash of the message just before theirs ("" when the
+        # thread began with its very first message), for `_find_sibling`.
+        self._roots_by_prev: Dict[str, Set[str]] = {}
         self._max = max_turns
         self._lock = threading.Lock()
         self._path = Path(path) if path else None
@@ -187,6 +202,7 @@ class TurnIndex:
         except (OSError, ValueError, TypeError):
             self._turns.clear()
             self._by_first.clear()
+            self._roots_by_prev.clear()
 
     def _save(self) -> None:
         """Write the index atomically; called with the lock held."""
@@ -207,27 +223,40 @@ class TurnIndex:
     def _first(shape: List[str]) -> str:
         return shape[0] if shape else ""
 
+    @staticmethod
+    def _prev_key(t: Turn) -> str:
+        return t.prefix[-1] if t.prefix else ""
+
     def _index(self, t: Turn) -> None:
         self._turns[t.cid] = t
         self._turns.move_to_end(t.cid)
         self._by_first.setdefault(self._first(t.shape), set()).add(t.cid)
+        if t.parent is None:
+            self._roots_by_prev.setdefault(self._prev_key(t), set()).add(t.cid)
+
+    @staticmethod
+    def _unindex(table: Dict[str, Set[str]], key: str, cid: str) -> None:
+        bucket = table.get(key)
+        if bucket:
+            bucket.discard(cid)
+            if not bucket:
+                del table[key]
 
     def _drop(self, cid: str) -> None:
         t = self._turns.pop(cid, None)
         if t is None:
             return
-        bucket = self._by_first.get(self._first(t.shape))
-        if bucket:
-            bucket.discard(cid)
-            if not bucket:
-                del self._by_first[self._first(t.shape)]
+        self._unindex(self._by_first, self._first(t.shape), cid)
+        if t.parent is None:
+            self._unindex(self._roots_by_prev, self._prev_key(t), cid)
 
     # ---- writes -------------------------------------------------------------
     def remember(self, history: History, conversation_id: str,
-                 parent: Optional[str], reply_fp: str, reply_text: str) -> None:
+                 parent: Optional[str], reply_fp: str, reply_text: str,
+                 account: str = "") -> None:
         """Record that `history` (a whole request) was answered from `parent`
-        and left the thread at `conversation_id`."""
-        if not conversation_id or not history:
+        and left the thread at `conversation_id`, under `account`."""
+        if not conversation_id or ":" not in conversation_id or not history:
             return
         role, text, _ = history[-1]
         prefix: List[str] = []
@@ -239,8 +268,12 @@ class TurnIndex:
         t = Turn(cid=conversation_id, parent=parent, role=role,
                  shape=message_shape(text), reply_fp=reply_fp,
                  reply_head=reply_head(reply_text), sys_head=system_head(history),
-                 prefix=prefix, ts=time.time())
+                 prefix=prefix, ts=time.time(), account=account)
         with self._lock:
+            # An account is replaced, never revisited (it was muted); its
+            # threads are dead and only clutter the index.
+            for cid in [c for c, o in self._turns.items() if o.account != account]:
+                self._drop(cid)
             self._drop(conversation_id)
             self._index(t)
             while len(self._turns) > self._max:
@@ -258,7 +291,7 @@ class TurnIndex:
             self._save()
 
     # ---- reads --------------------------------------------------------------
-    def find(self, history: History) -> Optional[Match]:
+    def find(self, history: History, account: str = "") -> Optional[Match]:
         """Locate the thread state a resent history continues from.
 
         Walks the alignable history messages newest-first. For each, every
@@ -267,9 +300,13 @@ class TurnIndex:
         (`_verify`), and the surviving candidates are ranked by evidence. The
         first position with an acceptable candidate wins: the thread state
         after that message is resumed and everything later is resent.
+
+        When no state can be resumed, `_find_sibling` looks for a thread that
+        BEGAN with the message now being regenerated or edited, so the turn
+        can at least stay in that chat as a new branch.
         """
         n = len(history)
-        if n < 2:
+        if n < 1:
             return None
         positions = _alignable(history)
         sys_h = system_head(history)
@@ -281,7 +318,8 @@ class TurnIndex:
                 best: Optional[Tuple[tuple, Match]] = None
                 for cid in cands:
                     t = self._turns[cid]
-                    if t.role != history[j][0] or not compatible(t.shape, shape):
+                    if t.account != account or t.role != history[j][0] \
+                            or not compatible(t.shape, shape):
                         continue
                     # The client's copy of the reply this state produced, when
                     # it is right after the message and not the message being
@@ -314,7 +352,53 @@ class TurnIndex:
                 if best:
                     self._turns.move_to_end(best[1].cid)
                     return best[1]
-        return None
+            return self._find_sibling(history, positions, sys_h, account)
+
+    def _find_sibling(self, history: History, positions: List[int],
+                      sys_h: str, account: str) -> Optional[Match]:
+        """A thread whose FIRST turn is the message now being sent again.
+
+        Regenerating or editing a thread's opening turn has no earlier state to
+        resume: the thread began with that message. Rather than open yet
+        another chat, the turn is re-sent in full as a sibling branch of the
+        same chat (a bare session id resumes a session at its root). The
+        history before the message must agree with what the root remembers of
+        it, and the usual evidence rule applies.
+        """
+        n = len(history)
+        role, text, _ = history[-1]
+        if role not in _ALIGNABLE or not text.strip():
+            return None
+        prev_key = message_hash(history[positions[-1]][1]) if positions else ""
+        shape = message_shape(text)
+        best: Optional[Tuple[tuple, Match]] = None
+        for cid in self._roots_by_prev.get(prev_key, ()):
+            t = self._turns[cid]
+            if t.account != account or t.role != role:
+                continue
+            # Verify the remembered prefix against the history, newest first.
+            depth, i = 0, len(positions) - 1
+            ok = True
+            for h in reversed(t.prefix):
+                if i < 0:
+                    break
+                if message_hash(history[positions[i]][1]) != h:
+                    ok = False
+                    break
+                depth, i = depth + 1, i - 1
+            if not ok:
+                continue
+            same = compatible(t.shape, shape)      # regenerated, not edited
+            sys_ok = bool(t.sys_head) and t.sys_head == sys_h
+            exhaustive = i < 0 and len(t.prefix) <= len(positions)
+            if not (depth >= 2 or (sys_ok and (depth >= 1 or same))):
+                continue
+            m = Match(cid=t.session, resume_from=0, depth=depth, sys=sys_ok,
+                      head=same, exhaustive=exhaustive, sibling=True)
+            rank = (depth, same, sys_ok, t.ts)
+            if best is None or rank > best[0]:
+                best = (rank, m)
+        return best[1] if best else None
 
     def _verify(self, t: Turn, history: History, positions: List[int],
                 idx: int) -> Optional[Tuple[int, bool]]:

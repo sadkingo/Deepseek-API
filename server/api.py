@@ -125,6 +125,13 @@ CONTINUE_PROMPT = ("Continue your previous reply from exactly where it stopped. 
                    "preamble; carry straight on.")
 
 
+def _account_of(client: DeepSeekClient) -> str:
+    """A tag for the signed-in account, derived from (not revealing) its token."""
+    import hashlib
+    token = getattr(getattr(client, "session", None), "token", "") or ""
+    return hashlib.sha1(token.encode("utf-8")).hexdigest()[:12] if token else ""
+
+
 def _session_of(conversation_id: str | None) -> str:
     """The chat-session part of a conversation_id — stable across turns."""
     return (conversation_id or "").partition(":")[0]
@@ -307,7 +314,19 @@ async def chat_completions(req: ChatCompletionRequest):
             status=404, err_type="model_not_found",
         )
 
+    try:
+        # Off the event loop: get_client() uses Playwright's sync API, which
+        # errors if run inside the asyncio loop.
+        client = await run_in_threadpool(get_client)
+    except LoginRequired as e:
+        return _error(str(e), status=503, err_type="login_required")
+    except Exception as e:  # session/login failure
+        return _error(f"Failed to initialise DeepSeek session: {e}")
+
     history = message_texts(req.messages)
+    # Threads belong to the signed-in account; after a muted account is
+    # replaced, everything the old one owned is dead.
+    account = _account_of(client)
 
     # Prefer continuing the DeepSeek thread this history already belongs to, so
     # only the new turns are sent and the model never sees a transcript to
@@ -324,7 +343,7 @@ async def chat_completions(req: ChatCompletionRequest):
     resume_from = len(history) - 1  # messages from here on are new to the thread
     match = None
     if conversation_id is None:
-        match = _threads.find(history)
+        match = _threads.find(history, account)
         if match:
             conversation_id, resume_from = match.cid, match.resume_from
             debuglog.log_thread(
@@ -355,7 +374,15 @@ async def chat_completions(req: ChatCompletionRequest):
     if directive:
         fresh_prompt = f"{fresh_prompt}\n\n{directive}"
 
-    if conversation_id:
+    if match and match.sibling:
+        # A regenerated or edited FIRST turn: the chat exists but has no state
+        # before this message, so the whole prompt goes again — into the same
+        # chat as a new branch (bare session id = resume at the root) rather
+        # than into a brand-new one. It is a fresh branch, so it needs the
+        # full prompt, including any tool protocol.
+        prompt = fresh_prompt
+        images = message_images(req.messages)
+    elif conversation_id:
         # Resuming: send only what this thread has not seen. Usually that is
         # the newest message; after a gap it is the few messages since the last
         # turn we recognised.
@@ -427,21 +454,14 @@ async def chat_completions(req: ChatCompletionRequest):
                                      for n, a in (calls or []))
             # A reply in another session means the resume failed and the turn
             # went out as a fresh thread: file it as a root, not a child.
-            parent = parent_cid if _session_of(parent_cid) == _session_of(cid) else None
-            _threads.remember(history, cid, parent, fingerprint, reply_text)
+            parent = parent_cid if (_session_of(parent_cid) == _session_of(cid)
+                                    and ":" in (parent_cid or "")) else None
+            _threads.remember(history, cid, parent, fingerprint, reply_text,
+                              account=account)
             if tools_fp:
                 # This thread has now seen these tools; later turns need not
                 # repeat the preamble unless the set changes again.
                 _thread_tools.put(_session_of(cid), tools_fp)
-
-    try:
-        # Off the event loop: get_client() uses Playwright's sync API, which
-        # errors if run inside the asyncio loop.
-        client = await run_in_threadpool(get_client)
-    except LoginRequired as e:
-        return _error(str(e), status=503, err_type="login_required")
-    except Exception as e:  # session/login failure
-        return _error(f"Failed to initialise DeepSeek session: {e}")
 
     def upload_images() -> list:
         """Upload the request's images to DeepSeek, returning their file ids.
