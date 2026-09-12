@@ -523,6 +523,14 @@ This is deliberately loose about everything frontends rewrite between turns:
   fresh one, the dead threads are skipped and pruned instead of each costing
   a failed resume.
 
+**Injected notes are stated once, and never parroted.** Roleplay frontends
+append instruction lines to every outgoing message (`SYSTEM NOTE: Do not
+include the following words...`, `[OOC: ...]`). Sent on every turn, the note
+ends up in the model's replies verbatim. So an identical note is sent to a
+chat only once — again only when it changes — and any reply line that repeats
+one (or any `SYSTEM NOTE:` line at all) is removed while the rest of the
+reply goes through, in streaming too.
+
 Each lookup writes a `~~ thread:` line to the request log saying what matched
 and on what evidence. The index is saved to `session/threads.json`
 (`THREADS_FILE` to relocate), so restarting the server keeps conversations on

@@ -95,11 +95,51 @@ def _label_re(labels) -> str:
     return rf"[ \t]*{_WRAP}[ \t]*{_label_alt(labels)}[ \t]*{_WRAP}[ \t]*[:：]"
 
 
-class _TurnPatterns:
-    """The leak regexes for one set of labels (the base set plus any extras)."""
+# Instruction lines a frontend injects into the user's message rather than
+# the user writing them: "SYSTEM NOTE: ...", "[OOC: ...]", "(Author's note: ...)".
+# A capitalised label with a colon, or a whole line in brackets/parentheses.
+_NOTE_LINE = re.compile(
+    r"^[ \t]*(?:[A-Z][A-Z'’ \-]{1,30}:|\[[^\]\n]{2,200}\]|\((?:OOC|Note|System)[^)\n]{0,200}\))")
+# What no reply should ever contain, whatever the request looked like.
+_GENERIC_ECHO = r"SYSTEM\s+NOTE\s*:[^\n]*"
 
-    def __init__(self, labels=()):
+
+def split_trailing_notes(text: str) -> Tuple[str, Tuple[str, ...]]:
+    """Separate a message from the note lines a frontend appended to it.
+
+    Walks up from the last line while lines look injected (`_NOTE_LINE`) and
+    returns (the message proper, those lines). Only a TRAILING block counts:
+    a label the user wrote mid-message stays where it is.
+    """
+    lines = text.rstrip().split("\n")
+    i = len(lines)
+    while i > 0 and (not lines[i - 1].strip() or _NOTE_LINE.match(lines[i - 1])):
+        i -= 1
+    notes = tuple(" ".join(l.split()) for l in lines[i:] if l.strip())
+    if not notes:
+        return text, ()
+    return "\n".join(lines[:i]).rstrip(), notes
+
+
+def injected_notes(messages: List[ChatMessage]) -> Tuple[str, ...]:
+    """The note lines appended to the request's newest user message."""
+    last = next((m for m in reversed(messages) if m.role == "user"), None)
+    if last is None:
+        return ()
+    return split_trailing_notes(_text_of(last.content))[1]
+
+
+def _loose(line: str) -> str:
+    """A regex matching `line` with any whitespace between its words."""
+    return r"\s+".join(re.escape(w) for w in line.split())
+
+
+class _TurnPatterns:
+    """The leak regexes for one set of labels and echoed note lines."""
+
+    def __init__(self, labels=(), echoes=()):
         self.labels = tuple(labels)
+        self.echoes = tuple(e for e in echoes if e.strip())
         label = _label_re(self.labels)
         self.leaked = re.compile(rf"(?:^|\n){label}|{_MARKERS}", re.IGNORECASE)
         # Mid-stream the buffer start is not the reply start, so "^" would
@@ -107,17 +147,30 @@ class _TurnPatterns:
         # tests the opening separately, while nothing has been emitted yet.
         self.leaked_stream = re.compile(rf"\n{label}|{_MARKERS}", re.IGNORECASE)
         self.leading = re.compile(rf"^{label}", re.IGNORECASE)
+        # A whole line the model copied from the request's injected note, or a
+        # SYSTEM NOTE of its own making. Such a line is removed, and the reply
+        # continues — unlike a leaked turn, which ends it.
+        alts = [_GENERIC_ECHO] + [_loose(e) for e in self.echoes]
+        body = "(?:" + "|".join(alts) + ")"
+        self.echo_line = re.compile(rf"^[ \t]*{body}[ \t]*$", re.IGNORECASE | re.MULTILINE)
+        # The same, taking the line's newline with it (whole-text removal).
+        self.echo_line_nl = re.compile(rf"^[ \t]*{body}[ \t]*(?:\n|\Z)",
+                                       re.IGNORECASE | re.MULTILINE)
+        # The opening of any such line, to know when to hold a partial one.
+        heads = [r"SYSTEM\s+NOTE"] + [_loose(" ".join(e.split()[:3])) for e in self.echoes]
+        self.echo_head = re.compile(r"(?:^|\n)[ \t]*(?:" + "|".join(heads) + ")", re.IGNORECASE)
         # Longest label that could straddle a chunk boundary, held back before
         # emitting: name plus wrappers, spaces and the colon.
         longest = max(len(n) for n in _BASE_LABELS + self.labels)
-        self.hold = max(16, longest + 12)
+        head_len = max([len(" ".join(e.split()[:3])) for e in self.echoes] + [12])
+        self.hold = max(16, longest + 12, head_len + 4)
 
 
 _BASE_PATTERNS = _TurnPatterns()
 
 
-def _patterns(labels) -> _TurnPatterns:
-    return _TurnPatterns(labels) if labels else _BASE_PATTERNS
+def _patterns(labels, echoes=()) -> _TurnPatterns:
+    return _TurnPatterns(labels, echoes) if (labels or echoes) else _BASE_PATTERNS
 
 
 # A reply may also open by labelling itself; that prefix is just dropped.
@@ -188,17 +241,20 @@ def _named_in_system(label: str, messages: List[ChatMessage]) -> bool:
                for m in messages)
 
 
-def strip_role_leak(text: str, labels=()) -> str:
-    """Drop a hallucinated next turn, and any label the reply gave itself.
+def strip_role_leak(text: str, labels=(), echoes=()) -> str:
+    """Drop a hallucinated next turn, echoed notes, and a self-label.
 
     `labels` are extra turn labels to cut at, besides User/Human/System — the
-    user's name as the client prefixes it (see `user_labels`).
+    user's name as the client prefixes it (see `user_labels`). `echoes` are
+    the note lines injected into the request (see `injected_notes`); a reply
+    line that repeats one is removed and the reply goes on.
     """
-    pats = _patterns(labels)
+    pats = _patterns(labels, echoes)
     text = _SELF_LABEL.sub("", text, count=1)
     m = pats.leaked.search(text)
     if m:
         text = text[: m.start()]
+    text = pats.echo_line_nl.sub("", text)
     return text.rstrip()
 
 
@@ -211,13 +267,65 @@ class RoleLeakFilter:
     iterator so the thread's message id still lands.
     """
 
-    def __init__(self, enabled: bool = True, labels=()) -> None:
+    def __init__(self, enabled: bool = True, labels=(), echoes=()) -> None:
         self.enabled = enabled
         self.stopped = False
-        self._pats = _patterns(labels)
+        self._pats = _patterns(labels, echoes)
         self._pending = ""
         self._emitted = False
         self._drop_ws = False
+        self._line_start = True   # does `_pending` begin at a line start?
+
+    def _drop_echoes(self, final: bool) -> None:
+        """Remove echoed note lines from `_pending`; hold a partial one.
+
+        A complete echoed line (newline-terminated, or at the end when
+        `final`) is cut out. A line that merely BEGINS like one is kept back
+        until its end arrives, by leaving it in `_pending` beyond the normal
+        hold — see `_safe_cut`.
+        """
+        while True:
+            m = self._pats.echo_head.search(self._pending)
+            if not m:
+                self._hold_from = None
+                return
+            if m.start() == 0 and self._pending[0] != "\n" and not self._line_start:
+                # "^" matched the buffer start, but that is mid-line.
+                self._hold_from = None
+                return
+            start = m.start() + (1 if self._pending[m.start()] == "\n" else 0)
+            end = self._pending.find("\n", start)
+            if end < 0:
+                if not final:
+                    self._hold_from = m.start()
+                    return
+                end = len(self._pending)
+            line = self._pending[start:end]
+            if self._pats.echo_line.fullmatch(line):
+                # Remove the line and one of the newlines around it, keeping
+                # a line break between what precedes and what follows.
+                tail = self._pending[end + 1:] if end < len(self._pending) else ""
+                head = self._pending[:m.start()]
+                broke = self._pending[m.start()] == "\n" or not self._line_start
+                # Keep the break even when nothing follows yet: the next chunk
+                # is the following line, and a trailing one is stripped at flush.
+                sep = "\n" if (head or broke) else ""
+                self._pending = head + sep + tail
+                continue
+            # Looked like a note but was not one: nothing to hold.
+            self._hold_from = None
+            return
+
+    def _safe_cut(self) -> int:
+        cut = max(0, len(self._pending) - self._pats.hold)
+        if getattr(self, "_hold_from", None) is not None:
+            cut = min(cut, self._hold_from)
+        # Trailing whitespace stays back until real text follows it, so a
+        # reply whose tail is removed (an echoed note, a leaked turn) does not
+        # end in blank lines that were already sent.
+        while cut > 0 and self._pending[cut - 1] in " \t\r\n":
+            cut -= 1
+        return cut
 
     def _trim_opening(self) -> bool:
         """Handle the reply's own start. True if the whole reply is a leak."""
@@ -251,16 +359,20 @@ class RoleLeakFilter:
 
         m = self._pats.leaked_stream.search(self._pending)
         if m:
-            out = self._pending[: m.start()].rstrip()
+            self._pending = self._pending[: m.start()]
+            self._drop_echoes(final=True)
+            out = self._pending.rstrip()
             self._pending = ""
             self.stopped = True
             self._emitted = self._emitted or bool(out)
             return out
 
-        cut = max(0, len(self._pending) - self._pats.hold)
+        self._drop_echoes(final=False)
+        cut = self._safe_cut()
         out, self._pending = self._pending[:cut], self._pending[cut:]
         if out:
             self._emitted = True
+            self._line_start = out.endswith("\n")
         return out
 
     def flush(self) -> str:
@@ -268,10 +380,11 @@ class RoleLeakFilter:
             return ""
         if not self._emitted and self._trim_opening():
             return ""
-        out, self._pending = self._pending, ""
-        m = self._pats.leaked_stream.search(out)
+        m = self._pats.leaked_stream.search(self._pending)
         if m:
-            out = out[: m.start()]
+            self._pending = self._pending[: m.start()]
+        self._drop_echoes(final=True)
+        out, self._pending = self._pending, ""
         return out.rstrip()
 
 
@@ -1494,6 +1607,7 @@ def stream_chunks(
     known_names: Optional[set] = None,
     on_turn: Optional[Callable[[list, str], None]] = None,
     leak_labels=(),
+    echo_lines=(),
 ) -> Iterable[str]:
     """Yield OpenAI SSE lines (`data: {...}\\n\\n`) for a streamed completion.
 
@@ -1537,7 +1651,7 @@ def stream_chunks(
     # — and that call is used only as a fallback (see below).
     think_tool = ToolCallExtractor(enabled=tools_enabled, strict=True,
                                    names=known_names, drop_unparsed=True)
-    leak = RoleLeakFilter(enabled=strip_leak, labels=leak_labels)
+    leak = RoleLeakFilter(enabled=strip_leak, labels=leak_labels, echoes=echo_lines)
     collected = []
     reasoning_all = []
     saw_reasoning = False

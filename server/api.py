@@ -22,6 +22,7 @@ RATE_LIMIT_PER_MINUTE); /healthz is exempt.
 from __future__ import annotations
 
 import faulthandler
+import hashlib
 import json
 import os
 import signal
@@ -65,10 +66,12 @@ from .openai_format import (
     tools_preamble,
     tools_reminder,
     user_labels,
+    injected_notes,
+    split_trailing_notes,
 )
 from .threads import ThreadCache, TurnIndex
 from .ratelimit import RateLimiter, install_rate_limit
-from .schemas import ChatCompletionRequest
+from .schemas import ChatCompletionRequest, ChatMessage
 
 load_dotenv()
 
@@ -117,6 +120,13 @@ _threads = TurnIndex(path=os.getenv(
 # this is a live case, not a hypothetical.
 _thread_tools = ThreadCache()
 
+# The injected note ("SYSTEM NOTE: do not use these words...") each DeepSeek
+# chat has already been sent, keyed by chat session. Frontends append the same
+# note to every message; a thread that has it in context does not need it
+# again, and seeing it on every turn is what makes the model copy it into
+# its replies. It is resent only when it changes.
+_thread_notes = ThreadCache()
+
 
 # Sent in place of a message when the client resends our own last reply and
 # nothing after it: it wants that reply continued.
@@ -127,7 +137,6 @@ CONTINUE_PROMPT = ("Continue your previous reply from exactly where it stopped. 
 
 def _account_of(client: DeepSeekClient) -> str:
     """A tag for the signed-in account, derived from (not revealing) its token."""
-    import hashlib
     token = getattr(getattr(client, "session", None), "token", "") or ""
     return hashlib.sha1(token.encode("utf-8")).hexdigest()[:12] if token else ""
 
@@ -361,6 +370,11 @@ async def chat_completions(req: ChatCompletionRequest):
     # The name the client prefixes the user's turns with ("sadking: ..."), so
     # a reply that goes on to write the user's next line is cut there.
     leak_labels = user_labels(req.messages)
+    # Instruction lines the frontend appended to the newest user message. A
+    # reply that repeats one has copied the request, not answered it.
+    echo_lines = injected_notes(req.messages)
+    notes_key = hashlib.sha1("\n".join(echo_lines).encode("utf-8")).hexdigest() \
+        if echo_lines else ""
 
     # The whole history as one prompt, used when starting a thread — and kept
     # around as the fallback for when a resumed thread turns out to be gone.
@@ -388,6 +402,13 @@ async def chat_completions(req: ChatCompletionRequest):
         # turn we recognised.
         new_msgs = req.messages[resume_from:] if req.conversation_id is None \
             else req.messages[-1:]
+        if (notes_key and new_msgs and new_msgs[-1].role == "user"
+                and isinstance(new_msgs[-1].content, str)
+                and _thread_notes.get(_session_of(conversation_id)) == notes_key):
+            # This chat already holds the identical note: send the message
+            # without it, so the note is stated once and not parroted back.
+            body, _ = split_trailing_notes(new_msgs[-1].content)
+            new_msgs = list(new_msgs[:-1]) + [ChatMessage(role="user", content=body)]
         prompt = messages_to_prompt(new_msgs)
         if match and match.continues:
             # The thread has seen everything; the client wants the reply this
@@ -462,6 +483,9 @@ async def chat_completions(req: ChatCompletionRequest):
                 # This thread has now seen these tools; later turns need not
                 # repeat the preamble unless the set changes again.
                 _thread_tools.put(_session_of(cid), tools_fp)
+            if notes_key:
+                # Likewise the injected note: it is in this chat's context now.
+                _thread_notes.put(_session_of(cid), notes_key)
 
     def upload_images() -> list:
         """Upload the request's images to DeepSeek, returning their file ids.
@@ -520,6 +544,7 @@ async def chat_completions(req: ChatCompletionRequest):
                     tools_enabled=bool(req.tools),
                     known_names=declared_tool_names(req.tools),
                     leak_labels=leak_labels,
+                    echo_lines=echo_lines,
                     on_turn=lambda cs, t: debuglog.log_turn(
                         cs, t, len(req.tools or []),
                         declared_tool_names(req.tools)),
@@ -589,7 +614,7 @@ async def chat_completions(req: ChatCompletionRequest):
                 reasoning, strict=True, known_names=names)
             if think_calls:
                 tool_calls, reasoning = think_calls, reasoning_text
-    text = strip_role_leak(text, leak_labels)
+    text = strip_role_leak(text, leak_labels, echo_lines)
 
     if not text.strip() and not tool_calls:
         # Nothing actionable came back. Either DeepSeek said nothing at all
