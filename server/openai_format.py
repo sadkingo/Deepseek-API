@@ -1367,36 +1367,18 @@ def assistant_fingerprint(tool_calls) -> str:
     )
 
 
-# How much of a system message is fingerprinted. Roleplay frontends rewrite the
-# system prompt every turn (lore entries injected by keyword, a note that
-# comes and goes), so its full text would never match twice; its opening — the
-# character card, the assistant's instructions — is what identifies the
-# conversation.
-_SYSTEM_HEAD = 300
+def message_texts(messages: List[ChatMessage]) -> List[Tuple[str, str, str]]:
+    """The (role, text, fingerprint) triples of a request, for thread matching.
 
-
-def _norm_lines(text: str) -> str:
-    """Normal form for fingerprinting: stripped lines, blanks dropped."""
-    return "\n".join(l.strip() for l in text.splitlines() if l.strip())
-
-
-def message_texts(messages: List[ChatMessage]) -> List[Tuple[str, str]]:
-    """The (role, text) pairs of a request, for thread fingerprinting.
-
-    Assistant turns contribute only their tool calls (`assistant_fingerprint`),
-    system turns only their opening (`_SYSTEM_HEAD` characters), user and tool
-    turns their whole text in `_norm_lines` form — the form `TurnIndex` relies
-    on to tell an appended note from a different message.
+    Text is the message as the model sees it (`_canonical_text`); the
+    fingerprint is the assistant turn's tool calls (`assistant_fingerprint`),
+    "" for every other role. How these are compared — which roles anchor, how
+    much of a system prompt counts, what an appended note looks like — is the
+    business of `threads.TurnIndex`.
     """
-    out = []
-    for m in messages:
-        if m.role == "assistant":
-            out.append((m.role, assistant_fingerprint(m.tool_calls)))
-        elif m.role == "system":
-            out.append((m.role, " ".join(_text_of(m.content).split())[:_SYSTEM_HEAD]))
-        else:
-            out.append((m.role, _norm_lines(_canonical_text(m))))
-    return out
+    return [(m.role, _canonical_text(m),
+             assistant_fingerprint(m.tool_calls) if m.role == "assistant" else "")
+            for m in messages]
 
 
 def flatten_directive(messages: List[ChatMessage]) -> str:

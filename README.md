@@ -475,36 +475,46 @@ yourself.
 
 ### A conversation replayed from scratch
 
-Threads are found by fingerprinting the history the client resends, and the
-fingerprint is deliberately loose about the parts frontends rewrite between
-turns:
+Threads are found by *aligning* the history the client resends against a tree
+of every turn this server has answered (`server/threads.py`). Each recorded
+turn knows the DeepSeek state it produced, the state it was sent from, and the
+shape of the message it carried (one hash per line). A lookup takes the newest
+history message we recognise, walks its ancestors and the earlier history
+backwards together, and accepts the best-supported state — the number of
+agreeing turns, whether the client kept the reply that state produced, and
+whether the system prompt opens the same way all count as evidence, and a lone
+"ok" that happens to match some thread somewhere counts for nothing.
 
-- **The assistant's own prose is ignored; its tool calls are used instead.**
-  That text is our output coming back, and a client may reshape it — Zed
-  returns assistant turns as a list of parts that includes the model's
-  *reasoning* next to the reply, so what comes back is not what we sent.
-- **The system prompt counts only by its opening** (the first 300 characters).
-  Roleplay frontends rebuild it every turn — lore entries injected by keyword,
-  notes that come and go — so its full text never matched twice, and the
-  same chat started a new DeepSeek thread on every single message.
+This is deliberately loose about everything frontends rewrite between turns:
+
+- **The assistant's own prose is not matched on**, only its tool calls and, as a
+  tiebreaker, how the reply opens. That text is our output coming back, and a
+  client may reshape it — Zed returns assistant turns as a list of parts that
+  includes the model's *reasoning* next to the reply.
+- **The system prompt is only a tiebreaker.** Roleplay frontends rebuild it
+  every turn — lore entries injected by keyword, summaries, author's notes —
+  so matching on it meant the same chat started a new DeepSeek thread on every
+  single message.
 - **A note appended to the outgoing message is tolerated.** SillyTavern-style
-  clients tack a `SYSTEM NOTE: ...` paragraph onto the newest user message,
-  then resend that message *without* it as history. A turn matches when the
-  text we answered equals the resent one or only extends it by whole
-  paragraphs.
+  clients tack a `SYSTEM NOTE: ...` paragraph onto the newest user message and
+  resend it *without* that paragraph as history.
+- **Dropped history is fine.** Once the context window fills, clients trim the
+  oldest messages; alignment does not need the start of the conversation.
+- **Regenerations and swipes branch.** Regenerating resumes from the state
+  *before* the turn, so DeepSeek forks the thread instead of seeing the
+  conversation twice, and whichever swipe the client keeps is recognised by
+  its opening on the next turn.
+- **Edits resume from before the edit.** A changed message anywhere in the
+  history rejects every thread state that was built on the old wording; the
+  lookup falls back to the last state that agrees and resends from there.
+- **"Continue" continues.** When the client resends our own last reply with
+  nothing after it, the thread is resumed with an instruction to carry on,
+  rather than being handed its own words as a new message.
 
-If one turn still does not match — a reply the client reworded, a turn that
-failed and was retried — the lookup walks back to the longest prefix it does
-recognise and sends only the messages since, instead of giving up and
-flattening the whole conversation into one prompt. Regenerating a reply resumes
-from the message *before* it, so DeepSeek branches the thread rather than
-seeing the conversation twice. That mattered in practice: a 17-message agentic
-session collapsed into a 94,000-character prompt, and a model handed a
-structureless transcript imitates it — describing a change in prose the way the
-earlier replies did, rather than calling a tool.
-
-The index is saved to `session/threads.json` (`THREADS_FILE` to relocate), so
-restarting the server keeps conversations on their threads.
+Each lookup writes a `~~ thread:` line to the request log saying what matched
+and on what evidence. The index is saved to `session/threads.json`
+(`THREADS_FILE` to relocate), so restarting the server keeps conversations on
+their threads.
 
 When there is genuinely nothing to resume, the flattened prompt ends with a
 `[NOW]` block naming the request still to be carried out, so the model has a

@@ -195,3 +195,10 @@ def log_error(message: str) -> None:
     if not ENABLED:
         return
     logger().info("<-- ERROR %s", message)
+
+
+def log_thread(message: str) -> None:
+    """How the thread lookup went: what matched, on what evidence, or nothing."""
+    if not ENABLED:
+        return
+    logger().info("    ~~ thread: %s", message)

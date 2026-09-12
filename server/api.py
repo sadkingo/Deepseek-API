@@ -118,6 +118,13 @@ _threads = TurnIndex(path=os.getenv(
 _thread_tools = ThreadCache()
 
 
+# Sent in place of a message when the client resends our own last reply and
+# nothing after it: it wants that reply continued.
+CONTINUE_PROMPT = ("Continue your previous reply from exactly where it stopped. "
+                   "Do not repeat anything already written and do not add a "
+                   "preamble; carry straight on.")
+
+
 def _session_of(conversation_id: str | None) -> str:
     """The chat-session part of a conversation_id — stable across turns."""
     return (conversation_id or "").partition(":")[0]
@@ -315,8 +322,19 @@ async def chat_completions(req: ChatCompletionRequest):
     # a slightly older prefix costs one extra message instead.
     conversation_id = req.conversation_id
     resume_from = len(history) - 1  # messages from here on are new to the thread
+    match = None
     if conversation_id is None:
-        conversation_id, resume_from = _threads.find(history)
+        match = _threads.find(history)
+        if match:
+            conversation_id, resume_from = match.cid, match.resume_from
+            debuglog.log_thread(
+                f"matched {match.cid} ({match.describe()}); "
+                f"resending {len(history) - resume_from} of {len(history)} messages")
+        else:
+            debuglog.log_thread(
+                f"no thread matches this history of {len(history)} messages")
+    # What this turn is sent from, so its result can be filed under it.
+    parent_cid = conversation_id
 
     # Only ever announce tools the caller actually declared for this request.
     tools_fp = tools_fingerprint(req.tools)
@@ -344,10 +362,15 @@ async def chat_completions(req: ChatCompletionRequest):
         new_msgs = req.messages[resume_from:] if req.conversation_id is None \
             else req.messages[-1:]
         prompt = messages_to_prompt(new_msgs)
+        if match and match.continues:
+            # The thread has seen everything; the client wants the reply this
+            # state produced to go on. Echoing that reply back as a prompt
+            # would make the model answer its own words instead.
+            prompt = CONTINUE_PROMPT
         if not prompt.strip():
             # Nothing but empty or image-only entries: fall back to the last
             # message that does carry text.
-            prompt = next((t for _, t in reversed(history) if t.strip()), "")
+            prompt = next((t for _, t, _ in reversed(history) if t.strip()), "")
         # Images from earlier turns were already attached when those turns were
         # sent, so only the new messages' images are uploaded.
         images = message_images(new_msgs)
@@ -402,7 +425,10 @@ async def chat_completions(req: ChatCompletionRequest):
         if cid:
             fingerprint = "\n".join(serialize_tool_call(n, a)
                                      for n, a in (calls or []))
-            _threads.remember(history, fingerprint, cid)
+            # A reply in another session means the resume failed and the turn
+            # went out as a fresh thread: file it as a root, not a child.
+            parent = parent_cid if _session_of(parent_cid) == _session_of(cid) else None
+            _threads.remember(history, cid, parent, fingerprint, reply_text)
             if tools_fp:
                 # This thread has now seen these tools; later turns need not
                 # repeat the preamble unless the set changes again.
