@@ -23,4 +23,7 @@ if ! curl -fsS -m 3 "http://localhost:$PORT/healthz" >/dev/null 2>&1; then
     echo "server first (run: start), or the tunnel URL will return errors." >&2
 fi
 
-exec "$CLOUDFLARED" tunnel --url "http://localhost:$PORT" "$@"
+# This network blocks outbound UDP on 7844, so QUIC handshakes time out;
+# force HTTP/2 instead of waiting out the QUIC retry loop. Override with
+# TUNNEL_PROTOCOL=quic if run somewhere UDP is open.
+exec "$CLOUDFLARED" tunnel --url "http://localhost:$PORT" --protocol "${TUNNEL_PROTOCOL:-http2}" "$@"

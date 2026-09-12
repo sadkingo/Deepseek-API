@@ -56,6 +56,20 @@ class ThreadCache:
             while len(self._entries) > self._max:
                 self._entries.popitem(last=False)
 
+    def forget(self, conversation_id: str) -> None:
+        """Drop every key pointing at `conversation_id`.
+
+        Used when DeepSeek says a thread is gone: leaving the mapping in place
+        would send the next turn straight back to the same dead thread.
+        """
+        if not conversation_id:
+            return
+        session = conversation_id.partition(":")[0]
+        with self._lock:
+            for key in [k for k, v in self._entries.items()
+                        if v == conversation_id or v.startswith(session + ":")]:
+                self._entries.pop(key, None)
+
     def __len__(self) -> int:
         with self._lock:
             return len(self._entries)

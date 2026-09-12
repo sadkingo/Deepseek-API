@@ -57,6 +57,22 @@ Equivalent long form:
 cd ~/Desktop/Deepseek-API && rm -rf session && source venv/bin/activate && python -m deepseek.auth
 ```
 
+## Muted-account auto-recovery
+
+Built into `start`. When DeepSeek answers a request with **"user is muted"**,
+the account is dead for good, so the server drops `logs/.account-muted` and
+exits; `start` (a supervisor loop) sees the flag, runs the global sign-up
+automation (`~/Desktop/Create account deepseek/bin/register`) to create a
+fresh account, and starts the server again on the new session — all in the
+same terminal, no action needed.
+
+Safeguards: the server fires the flag at most once per lifetime, register is
+retried up to 3 times, and `start` refuses to recover twice within 10 minutes
+(stamp file `logs/.recover-stamp`), so a freshly muted replacement account
+can't spiral into endless registrations. Ctrl-C and ordinary crashes exit as
+before — only a mute triggers the loop. Note the recovery only happens when
+the server was launched via `start`; a bare `python app.py` just exits.
+
 ## Public HTTPS tunnel
 
 Run in a second terminal, with the server already running — it warns you if

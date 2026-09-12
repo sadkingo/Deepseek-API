@@ -1,8 +1,13 @@
 #!/usr/bin/env bash
 # Start the OpenAI-compatible DeepSeek server in the foreground (Ctrl-C stops it).
 #
-# Runs the venv's interpreter directly instead of activating the venv: the
-# effect is identical for this process and it leaves the caller's shell alone.
+# Also supervises it: if DeepSeek mutes the account, the server exits with a
+# flag file set, and this script registers a fresh account and restarts the
+# server automatically. See "muted-account auto-recovery" below.
+#
+# If a server is already listening on the port, that one is stopped first.
+# Otherwise this would fail to bind and the OLD process would keep serving —
+# silently, so code changes appear to do nothing.
 set -euo pipefail
 
 cd "$(dirname "$(readlink -f "$0")")/.."
@@ -13,5 +18,77 @@ if [ ! -x venv/bin/python ]; then
     exit 1
 fi
 
-echo "Starting DeepSeek API server (Ctrl-C to stop)…"
-exec venv/bin/python app.py "$@"
+PORT="${PORT:-$(grep -E '^PORT=' .env 2>/dev/null | tail -1 | cut -d= -f2)}"
+PORT="${PORT:-8000}"
+
+# Anything of ours already on that port? Match our own app.py processes only,
+# so an unrelated program using the port is reported rather than killed.
+running=$(pgrep -f "[p]ython.*app\.py" 2>/dev/null || true)
+if [ -n "$running" ] && curl -fsS -m 2 "http://localhost:$PORT/healthz" >/dev/null 2>&1; then
+    for pid in $running; do
+        started=$(ps -o lstart= -p "$pid" 2>/dev/null || echo "?")
+        echo "Stopping the server already running on port $PORT (pid $pid, up since${started})"
+        kill "$pid" 2>/dev/null || true
+    done
+    for _ in 1 2 3 4 5 6 7 8 9 10; do
+        curl -fsS -m 1 "http://localhost:$PORT/healthz" >/dev/null 2>&1 || break
+        sleep 0.5
+    done
+elif curl -fsS -m 2 "http://localhost:$PORT/healthz" >/dev/null 2>&1; then
+    echo "Something else is already serving on port $PORT and it is not this" >&2
+    echo "project. Stop it, or run with another port:  PORT=8001 start" >&2
+    exit 1
+fi
+
+# --- muted-account auto-recovery -------------------------------------------
+# DeepSeek muting an account is permanent; the only fix is a fresh account.
+# When the server sees "user is muted" from upstream it drops this flag file
+# and exits (see server/api.py). The loop below then runs the global sign-up
+# automation to register a fresh account (which writes session/session.json)
+# and starts the server again — fully automatic, in this same terminal.
+MUTED_FLAG=logs/.account-muted
+STAMP=logs/.recover-stamp
+REGISTER="${REGISTER_CMD:-$HOME/Desktop/Create account deepseek/bin/register}"
+mkdir -p logs
+rm -f "$MUTED_FLAG"  # a stale flag from an old run must not trigger a register
+
+echo "Starting DeepSeek API server on port $PORT (Ctrl-C to stop)…"
+while :; do
+    code=0
+    venv/bin/python app.py "$@" || code=$?
+
+    # Any exit without the flag — Ctrl-C, crash, clean stop — is final.
+    [ -e "$MUTED_FLAG" ] || exit "$code"
+    rm -f "$MUTED_FLAG"
+    echo "DeepSeek muted the account — registering a fresh one…"
+
+    # Refuse to loop if a recovery already ran in the last 10 minutes, so a
+    # replacement account that gets muted straight away can't burn through
+    # endless registrations.
+    if [ -e "$STAMP" ] && [ -n "$(find "$STAMP" -newermt '-10 minutes' 2>/dev/null)" ]; then
+        echo "A recovery already ran within the last 10 minutes — not looping." >&2
+        exit 1
+    fi
+    touch "$STAMP"
+
+    if [ ! -x "$REGISTER" ]; then
+        echo "Register script not found or not executable: $REGISTER" >&2
+        exit 1
+    fi
+    registered=
+    for attempt in 1 2 3; do
+        echo "--- register attempt $attempt"
+        if "$REGISTER"; then
+            registered=1
+            break
+        fi
+        echo "register attempt $attempt failed"
+        sleep 15
+    done
+    if [ -z "$registered" ]; then
+        echo "Register failed 3 times — giving up." >&2
+        exit 1
+    fi
+
+    echo "Fresh account registered — restarting the server…"
+done

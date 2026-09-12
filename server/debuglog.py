@@ -21,6 +21,10 @@ ROOT = Path(__file__).resolve().parent.parent
 ENABLED = os.getenv("LOG_REQUESTS", "1").lower() not in ("0", "false", "no", "off")
 LOG_FILE = Path(os.getenv("LOG_FILE", ROOT / "logs" / "requests.log"))
 MAX_BODY = int(os.getenv("LOG_MAX_BODY", "4000"))
+# Replies are clipped separately: the interesting part is often the END (a
+# trailing tool call, a disclaimer DeepSeek appended), so log enough of it to
+# see that, and log the tail as well as the head when it is long.
+MAX_REPLY = int(os.getenv("LOG_MAX_REPLY", "2000"))
 
 _log: Optional[logging.Logger] = None
 
@@ -46,6 +50,15 @@ def logger() -> logging.Logger:
         lg.addHandler(rotating)
     except OSError as e:  # read-only dir, bad path - stdout logging still works
         lg.warning("[log] file logging disabled: %s", e)
+
+    # The client library logs what it receives from DeepSeek to its own
+    # logger (see deepseek/client.py). Give it these handlers so upstream
+    # responses land in the same file as the requests that caused them.
+    upstream = logging.getLogger("deepseek.upstream")
+    upstream.setLevel(logging.INFO)
+    upstream.propagate = False
+    for handler in lg.handlers:
+        upstream.addHandler(handler)
 
     _log = lg
     return lg
@@ -120,13 +133,61 @@ def log_prompt(prompt: str, conversation_id: Optional[str], resumed: bool) -> No
     )
 
 
+def _clip_both_ends(text: str, limit: int) -> str:
+    """Head and tail of `text`, so a long reply's ending stays visible."""
+    if len(text) <= limit:
+        return text
+    head, tail = limit * 2 // 3, limit // 3
+    return f"{text[:head]}... (+{len(text) - limit} chars) ...{text[-tail:]}"
+
+
 def log_reply(text: str, conversation_id: Optional[str], streamed: bool = False) -> None:
     if not ENABLED:
         return
     logger().info(
         "<-- reply%s len=%d cid=%s: %s",
         " (streamed)" if streamed else "", len(text), conversation_id or "-",
-        _clip(text, 400),
+        _clip_both_ends(text, MAX_REPLY),
+    )
+
+
+def log_turn(tool_calls, text: str, tools_offered: int,
+             names: "set[str] | None" = None) -> None:
+    """One line saying whether the model acted or only talked.
+
+    The failure that is hard to see any other way is a turn that offers tools,
+    calls none of them, and answers with a wall of code — "I've updated the
+    file" without touching it. Spelling that out makes it a log line instead of
+    an investigation.
+    """
+    if not ENABLED:
+        return
+    if tool_calls:
+        names = ", ".join(n for n, _ in tool_calls)
+        logger().info("<-- turn: %d tool call(s) [%s], %d chars of text",
+                      len(tool_calls), names, len(text))
+        return
+    if not tools_offered:
+        return  # no tools were on offer; nothing to report
+    # If a declared tool NAME appears in a reply that produced no call, the
+    # model almost certainly wrote a call in a syntax this version does not
+    # recognise. Print the surrounding text: that is the whole diagnosis, and
+    # it saves reconstructing the format from a screenshot.
+    hit = next((n for n in sorted(names or ()) if n in text), None)
+    if hit:
+        i = text.find(hit)
+        excerpt = text[max(0, i - 60):i + 200].replace("\n", "\\n")
+        logger().info(
+            "<-- turn: NO tool calls though %d tool(s) offered, but the reply "
+            "mentions the tool %r — probably a call in an UNRECOGNISED format. "
+            "Around it: %s", tools_offered, hit, excerpt)
+        return
+    fenced = text.count("```") >= 2
+    logger().info(
+        "<-- turn: NO tool calls though %d tool(s) offered, %d chars of text%s",
+        tools_offered, len(text),
+        " — reply contains a code block, so the model likely described a "
+        "change instead of making it" if fenced else "",
     )
 
 

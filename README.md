@@ -28,6 +28,7 @@ You sign in once in a browser with your DeepSeek account; your session is saved 
 - [Using it from Zed](#using-it-from-zed)
 - [Concurrency](#concurrency)
 - [Rate limiting](#rate-limiting)
+- [Logs](#logs)
 - [Project layout](#project-layout)
 - [Notes & limitations](#notes--limitations)
 - [License](#license)
@@ -284,12 +285,29 @@ resp.choices[0].message.tool_calls  # -> [ChatCompletionMessageToolCall(...)]
 
 Because it is prompt-level, expect these limits:
 
-- **One call per reply.** Parallel tool calls aren't supported; keep
-  `parallel_tool_calls: false`.
+- **Several calls per reply are supported.** Asked to read five files, the
+  model writes five call objects in one reply; all of them are returned in the
+  `tool_calls` array. They are reported together at the end of a stream rather
+  than truly in parallel, so `parallel_tool_calls: false` remains the honest
+  setting for Zed.
 - **`tool_choice` is accepted but not enforced** — the model decides, so it may
   answer directly when you demanded a call.
 - **Reliability is the model's, not the protocol's.** The parser is
-  deliberately liberal — it also accepts ReAct (`Action:` / `Action Input:`),
+  deliberately liberal — it also accepts labelled calls in whatever spelling the
+  model picks (`Action:`/`Action Input:`, `Tool:`/`Arguments:`,
+  `Function:`/`Parameters:`, …, matched only when a declared tool name follows
+  the label, so prose is not mistaken for a call), calls written as an
+  expression (`read_file({"path": "a.js"})`, likewise gated on the name being a
+  declared tool so real code is left alone), and a call the model left
+  unterminated — dropping the final `}` is a common slip, and at most three
+  closing brackets are supplied so a genuinely cut-off reply is not completed
+  by guesswork. Each call is bounded by the start of the next one before being
+  repaired, so a run of several calls that each drop their closing brace stays
+  a run of several calls. As a catch-all there is also a general rule: a
+  declared tool name followed by a JSON object, with nothing but punctuation, a
+  code fence or a linking word between them, is a call however the model dressed
+  it up (`**Calling:** \`read_file\`` above a fenced object, say). The name
+  having to be a declared tool is what keeps prose out,
   `<tool_call>` tags, fenced JSON, curly quotes, single quotes, trailing
   commas, Python `True`/`None` literals, **raw newlines and tabs inside JSON
   strings** (which any file-writing tool hits, since its arguments carry source
@@ -309,6 +327,39 @@ Because it is prompt-level, expect these limits:
   UI's own notice bar — e.g. "This response is AI-generated, for reference
   only." on finance or health questions — which is dropped rather than appended
   to the answer.
+- **How to use the tools is explained, not just what they are.** The protocol
+  block adds rules derived from the declared schemas: call the tool rather than
+  printing the new file, match replace-style edits byte for byte, and put raw
+  text (no ``` fences) in content arguments. Each rule appears only when the
+  declared tools can actually hit it.
+- **A short reminder rides along on every tool turn.** The full block is sent
+  once, but a long session drifts back to answering with a code block instead
+  of editing, so the format and the obligation to act are restated each turn
+  (~300 characters; the schemas are not repeated).
+- **Tools are announced once per thread, and again when they change.** The
+  schemas are injected only when the request actually carries `tools`. On a
+  resumed thread they are not repeated — unless the set differs from what that
+  thread was told, which covers tools being switched on mid-conversation or a
+  changed list. A mid-conversation announcement says so explicitly, because a
+  thread that started without tools otherwise keeps insisting it has no access.
+- **A reply that invents tool results is cut where the invention starts.** Given
+  a transcript full of `<function_result>` blocks, the model sometimes carries
+  the conversation on by itself — writing a call, then a plausible
+  "Successfully applied 1 edit", then more calls based on that fiction. Results
+  come from the client, never the model, so everything from the first
+  fabricated one is discarded and the genuine call before it is returned. The
+  client runs it and sends back the real result.
+- **A call planned while thinking still runs.** With DeepThink on the model
+  often works the call out in its reasoning and then writes prose about it; that
+  call is used whenever the reply itself made none, rather than being treated as
+  merely contemplated. A call the model began mid-thought and abandoned is
+  dropped from the displayed reasoning instead of showing as raw JSON — but only
+  when it is genuinely unfinished, so ordinary JSON in the reasoning survives.
+- **A rejected path gets a correction attached.** When a tool answers that a
+  path is "outside the project", the model reads that as *too long* and
+  shortens it, which loops. The result is passed through with a note saying the
+  real cause — paths begin with the project root directory's own name — so it
+  fixes the call instead of retrying variations.
 - **Calls made inside DeepThink reasoning are rescued.** With thinking on, the
   model sometimes ends its reasoning with the call and writes no reply; that
   call is used (and removed from the reasoning) rather than left to stall the
@@ -409,6 +460,9 @@ it caps accepted requests **per client IP** and returns a standard `429` +
 | Env var | Default | Meaning |
 | --- | --- | --- |
 | `RATE_LIMIT_PER_MINUTE` | `30` | Requests/minute accepted per client IP |
+| `DEEPSEEK_PACE_FIRST_DELAY` | `3` | Gap after the first throttled reply (seconds) |
+| `DEEPSEEK_PACE_MAX_DELAY` | `30` | Largest gap the backoff will grow to |
+| `LOG_MAX_REPLY` | `2000` | Reply characters logged (head **and** tail) |
 
 ```bash
 RATE_LIMIT_PER_MINUTE=60 python app.py   # raise it
@@ -419,14 +473,56 @@ retry with growing delays (e.g. 1s, 2s, 4s). The official `openai` SDK does this
 automatically and honours `Retry-After`; with plain HTTP, add a few retries
 yourself.
 
+### A conversation replayed from scratch
+
+Threads are found by fingerprinting the history the client resends. The
+fingerprint deliberately ignores the assistant's own prose and uses its tool
+calls instead: that text is our output coming back, and a client may reshape it
+— Zed returns assistant turns as a list of parts that includes the model's
+*reasoning* next to the reply, so what comes back is not what we sent. Matching
+on it meant no thread was ever found. If one turn
+does not match — a reply the client reworded, a turn that failed and was
+retried — the lookup walks back to the longest prefix it does recognise and
+sends only the messages since, instead of giving up and flattening the whole
+conversation into one prompt. That mattered in practice: a 17-message agentic
+session collapsed into a 94,000-character prompt, and a model handed a
+structureless transcript imitates it — describing a change in prose the way the
+earlier replies did, rather than calling a tool.
+
+When there is genuinely nothing to resume, the flattened prompt ends with a
+`[NOW]` block naming the request still to be carried out, so the model has a
+present-tense instruction instead of a pattern to copy.
+
+### A thread that vanished
+
+DeepSeek prunes chat sessions. Resuming one that is gone fails with "invalid
+message id", so that case is caught: the stale mapping is dropped and the turn
+is retried as a fresh thread built from the history the client resent. In
+streaming the retry happens before any frame is sent, so it stays invisible.
+
+### DeepSeek's own rate limit (`429 rate_limit_error`)
+
+When the account is over DeepSeek's limit it answers with an OK-looking
+envelope whose `biz_code` is 7 and `biz_msg` is "rate limit reached". That is
+surfaced as a standard `429` with `Retry-After: 60`, so OpenAI clients back off
+on their own instead of retrying into the same wall.
+
 ### Upstream throttling (`503 overloaded_error`)
 
 Separately from this server's own limit, **DeepSeek throttles the account** when
 you send a lot of requests in a short span. It does this by accepting the
 request and returning an empty reply almost instantly.
 
-Because that costs the account nothing and usually clears at once, the client
-**retries such a request once** (after `DEEPSEEK_EMPTY_RETRY_DELAY`, default 2s)
+The client **paces itself** in response. While replies come through there is no
+delay at all; the first throttled reply spaces requests
+`DEEPSEEK_PACE_FIRST_DELAY` (3s) apart, each further one doubles that up to
+`DEEPSEEK_PACE_MAX_DELAY` (30s), and successes halve it back to zero. So a
+healthy session pays nothing and a throttled one slows down only as much as it
+must. The gap in force is also sent as `Retry-After`, so the caller's own
+backoff lines up with it rather than retrying into a wall.
+
+Because a throttled request costs the account nothing and usually clears at
+once, the client also **retries such a request once** (after `DEEPSEEK_EMPTY_RETRY_DELAY`, default 2s)
 before giving up — nothing has been emitted at that point, so no output can be
 duplicated. If the retry is empty too, the server returns a
 `503 overloaded_error` telling you to retry, rather than handing your client a
@@ -435,6 +531,37 @@ blank message that would stall an agent.
 If you see it repeatedly, slow down — the account is being rate limited, and
 hammering it harder is what gets a DeepSeek account muted. Waiting a minute or
 two clears it.
+
+---
+
+## Logs
+
+`logs/requests.log` (rotating, also echoed to stdout) records both sides of
+every call, which is the first place to look when a reply comes out wrong:
+
+| Line | What it tells you |
+| --- | --- |
+| `--> POST …` + `raw body` | exactly what the client sent, including `tools` |
+| `=> NEW thread` / `RESUME thread` | whether the DeepSeek thread was continued. A `NEW thread` with a huge `prompt(…)` mid-conversation means the thread was lost and the history was replayed — see below |
+| `<= upstream stream: …` | **what DeepSeek actually returned** — bytes per kind (`text`, `thinking`), duration, attempt, `message_id`, and the flags used |
+| `unknown fragment type …` | DeepSeek sent a content kind this version does not know |
+| `upstream rejected request: biz_code=…` | DeepSeek refused it (7 = rate limit) |
+| `<-- turn: … UNRECOGNISED format` | the reply named one of the tools but produced no call — a calling syntax this version cannot parse, printed with the surrounding text so it can be added |
+| `<-- turn: …` | whether the model **acted or only talked** — the tool calls it made, or a warning that it made none although tools were offered |
+| `<-- reply len=…` | the finished reply, head **and** tail (`LOG_MAX_REPLY`) |
+
+If a change you asked for never happened, the `<-- turn:` line settles why in
+one read: `NO tool calls though 12 tool(s) offered … reply contains a code
+block` means the model described the edit instead of making it, while a line
+naming `edit_file` means the call was made and the question is what the editor
+did with it.
+
+The upstream line is the useful one: a reply that arrives as `nothing`, or
+entirely as `thinking=…` with no `text`, or under a fragment type that is not
+recognised, explains a bad answer that the finished text alone does not.
+
+> The log contains prompt text, so treat it as sensitive. Turn it off with
+> `LOG_REQUESTS=0`; `logs/` is git-ignored.
 
 ---
 
