@@ -81,7 +81,7 @@ def _text_of(content) -> str:
 # then copies THAT label to write the user's lines. `user_labels` finds such a
 # prefix in the history and the patterns below are built to include it, with
 # the markdown wrappers the model likes to add ("**sadking**:").
-_BASE_LABELS = ("User", "Human", "System")
+_BASE_LABELS = ("User", "Human", "System", "Developer")
 _WRAP = r"(?:\*\*|\*|__|_)?"
 _MARKERS = r"</?\s*(?:function_result|tool_result|tool_response)\s*>"
 
@@ -237,7 +237,7 @@ def _named_in_system(label: str, messages: List[ChatMessage]) -> bool:
     if " " in label:
         return False
     word = re.compile(rf"(?<![\w]){re.escape(label)}(?![\w])")
-    return any(m.role == "system" and word.search(_text_of(m.content))
+    return any(m.role in ("system", "developer") and word.search(_text_of(m.content))
                for m in messages)
 
 
@@ -1608,6 +1608,8 @@ def stream_chunks(
     on_turn: Optional[Callable[[list, str], None]] = None,
     leak_labels=(),
     echo_lines=(),
+    include_usage: bool = False,
+    prompt_text: str = "",
 ) -> Iterable[str]:
     """Yield OpenAI SSE lines (`data: {...}\\n\\n`) for a streamed completion.
 
@@ -1775,4 +1777,20 @@ def stream_chunks(
         if on_done:
             on_done("".join(collected), conversation_id, [])
         yield frame({}, finish="stop", extra={"conversation_id": conversation_id})
+    if include_usage:
+        pt = _est_tokens(prompt_text)
+        ct = _est_tokens("".join(collected) + "".join(reasoning_all))
+        usage_obj = {
+            "id": cid,
+            "object": "chat.completion.chunk",
+            "created": created,
+            "model": model,
+            "choices": [],
+            "usage": {
+                "prompt_tokens": pt,
+                "completion_tokens": ct,
+                "total_tokens": pt + ct,
+            },
+        }
+        yield f"data: {json.dumps(usage_obj, ensure_ascii=False)}\n\n"
     yield "data: [DONE]\n\n"

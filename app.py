@@ -15,6 +15,14 @@ from dotenv import load_dotenv
 load_dotenv()
 
 if __name__ == "__main__":
+    from server.config import ENABLE_WAF_SIDECAR, WAF_REFRESH_INTERVAL
+    if ENABLE_WAF_SIDECAR:
+        try:
+            from deepseek.auth import start_waf_sidecar
+            start_waf_sidecar(interval_seconds=WAF_REFRESH_INTERVAL)
+        except Exception as e:
+            print(f"[warning] Could not start WAF sidecar: {e}")
+
     # Serve HTTPS when a cert pair is configured. A browser page loaded over
     # https:// cannot call an http:// API (mixed content), so an internet-facing
     # deployment needs TLS either here or behind a reverse proxy.

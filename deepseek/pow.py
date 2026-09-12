@@ -38,6 +38,7 @@ class DeepSeekPow:
         self._memory: wasmtime.Memory = exp["memory"]
         self._solve = exp["wasm_solve"]
         self._malloc = exp["__wbindgen_export_0"]            # malloc(size, align)
+        self._free = exp["__wbindgen_export_2"]              # free(ptr, size, align)
         self._add_to_stack = exp["__wbindgen_add_to_stack_pointer"]
 
     def _write_str(self, text: str) -> tuple[int, int]:

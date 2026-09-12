@@ -12,6 +12,7 @@ keeps its own counters.
 
 from __future__ import annotations
 
+import os
 import threading
 import time
 from collections import defaultdict, deque
@@ -94,9 +95,20 @@ def install_rate_limit(
         return resp
 
 
+TRUST_PROXY_HEADERS = os.getenv("TRUST_PROXY_HEADERS", "1").lower() in ("1", "true", "yes")
+TRUSTED_PROXIES = {
+    ip.strip() for ip in os.getenv("TRUSTED_PROXIES", "127.0.0.1,::1").split(",") if ip.strip()
+}
+
+
 def _client_key(request: Request) -> str:
-    """Best-effort client identity: first X-Forwarded-For hop, else peer IP."""
-    fwd = request.headers.get("x-forwarded-for")
-    if fwd:
-        return fwd.split(",")[0].strip()
-    return request.client.host if request.client else "unknown"
+    """Client identity: X-Forwarded-For / CF-Connecting-IP only if peer is trusted proxy, else peer IP."""
+    peer_ip = request.client.host if request.client else "unknown"
+    if TRUST_PROXY_HEADERS and (peer_ip in TRUSTED_PROXIES or peer_ip.startswith("127.") or peer_ip == "::1"):
+        cf_ip = request.headers.get("cf-connecting-ip")
+        if cf_ip:
+            return cf_ip.strip()
+        fwd = request.headers.get("x-forwarded-for")
+        if fwd:
+            return fwd.split(",")[0].strip()
+    return peer_ip

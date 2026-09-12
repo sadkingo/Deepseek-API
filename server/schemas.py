@@ -37,6 +37,7 @@ class ChatCompletionRequest(BaseModel):
     tools: Optional[List[dict]] = None
     tool_choice: Optional[Union[str, dict]] = None  # accepted, not enforced
     parallel_tool_calls: Optional[bool] = None      # always effectively False
+    stream_options: Optional[dict] = None           # e.g. {"include_usage": True}
     # Accepted for compatibility but not all are forwarded to DeepSeek.
     temperature: Optional[float] = None
     top_p: Optional[float] = None

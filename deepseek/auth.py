@@ -18,13 +18,17 @@ you've signed in, later runs reuse the profile and capture the token headlessly.
 from __future__ import annotations
 
 import json
+import logging
 import os
+import threading
 import time
 from dataclasses import dataclass, asdict
 from pathlib import Path
 from typing import Dict, Optional
 
 from playwright.sync_api import sync_playwright
+
+_auth_log = logging.getLogger("deepseek.auth")
 
 ROOT = Path(__file__).resolve().parent.parent
 # Override with DEEPSEEK_PROFILE_DIR to reuse an existing signed-in Chrome profile.
@@ -231,6 +235,7 @@ def get_session(
     session_file: Path = DEFAULT_SESSION_FILE,
     max_age: int = SESSION_MAX_AGE,
     allow_interactive: bool = True,
+    force_refresh: bool = False,
 ) -> Session:
     """Return a usable session: cached file if fresh, else a headless refresh
     from the browser profile.
@@ -241,9 +246,10 @@ def get_session(
 
     Note: this uses Playwright's *sync* API, so it must not be called from inside
     an asyncio event loop — call it from a worker thread (e.g. run_in_threadpool)."""
-    cached = Session.load(session_file)
-    if cached and cached.age < max_age:
-        return cached
+    if not force_refresh:
+        cached = Session.load(session_file)
+        if cached and cached.age < max_age:
+            return cached
 
     # Try a headless refresh from the (presumably logged-in) persistent profile.
     session = _headless_refresh(profile_dir)
@@ -259,6 +265,39 @@ def get_session(
     # (above) there's no token, so go straight to the sign-in page.
     print("[auth] No valid session found — opening a browser window to log in...")
     return login(profile_dir=profile_dir, assume_logged_out=True)
+
+
+_waf_sidecar_thread: Optional[threading.Thread] = None
+
+
+def start_waf_sidecar(
+    profile_dir: Path = DEFAULT_PROFILE_DIR,
+    interval_seconds: int = 2400,
+) -> None:
+    """Launch a background daemon thread that periodically refreshes the session
+    and rotates AWS WAF tokens using the headless Playwright profile."""
+    global _waf_sidecar_thread
+    if _waf_sidecar_thread and _waf_sidecar_thread.is_alive():
+        return
+
+    def _worker():
+        _auth_log.info("WAF sidecar started (refresh interval: %ds)", interval_seconds)
+        while True:
+            time.sleep(interval_seconds)
+            try:
+                _auth_log.debug("WAF sidecar: performing background session/WAF refresh...")
+                s = _headless_refresh(profile_dir)
+                if s and "aws-waf-token" in s.cookies:
+                    _auth_log.info("WAF sidecar: rotated aws-waf-token successfully")
+                elif s:
+                    _auth_log.info("WAF sidecar: session refreshed successfully")
+                else:
+                    _auth_log.warning("WAF sidecar: headless refresh returned no session")
+            except Exception as e:
+                _auth_log.warning("WAF sidecar refresh error: %s", e)
+
+    _waf_sidecar_thread = threading.Thread(target=_worker, name="waf-sidecar", daemon=True)
+    _waf_sidecar_thread.start()
 
 
 if __name__ == "__main__":

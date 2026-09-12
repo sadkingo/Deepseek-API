@@ -86,7 +86,7 @@ def system_head(history: History) -> str:
     """Hash of the opening of the leading system message(s)."""
     parts = []
     for role, text, _ in history:
-        if role != "system":
+        if role not in ("system", "developer"):
             break
         parts.append(text)
     if not parts:

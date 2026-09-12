@@ -35,12 +35,14 @@ from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, StreamingResponse
 from starlette.concurrency import run_in_threadpool
+from starlette.requests import Request
 
 from . import debuglog
 from deepseek.auth import LoginRequired
 from deepseek.client import DeepSeekClient, RateLimited, ServerBusy
 
 from .config import (
+    API_KEY,
     CORS_ORIGINS,
     resolve_alias,
     MODEL_MAP,
@@ -151,7 +153,7 @@ def _session_of(conversation_id: str | None) -> str:
 UPSTREAM_WEDGE_TIMEOUT = float(os.getenv("UPSTREAM_WEDGE_TIMEOUT", "120"))
 
 
-def get_client() -> DeepSeekClient:
+def get_client(force_refresh: bool = False) -> DeepSeekClient:
     """Build (once) the shared client and its signed-in session.
 
     Session resolution: cached file → headless capture off the persistent
@@ -164,10 +166,11 @@ def get_client() -> DeepSeekClient:
     loop (via run_in_threadpool); calling it inside the asyncio loop raises
     "Playwright Sync API inside the asyncio loop"."""
     global _client
-    if _client is None:
+    if _client is None or force_refresh:
         with _client_lock:
-            if _client is None:
-                _client = DeepSeekClient(allow_interactive=SERVER_INTERACTIVE_LOGIN)
+            if _client is None or force_refresh:
+                _client = DeepSeekClient(allow_interactive=SERVER_INTERACTIVE_LOGIN,
+                                         force_refresh=force_refresh)
     return _client
 
 
@@ -290,9 +293,19 @@ async def _log_completions(request, call_next):
     return response
 
 
+def _check_auth(request: Request):
+    if not API_KEY:
+        return None
+    auth = request.headers.get("authorization", "")
+    token = auth.removeprefix("Bearer ").strip() if auth.startswith("Bearer ") else auth.strip()
+    if token != API_KEY:
+        return _error("Incorrect or missing API key.", status=401, err_type="authentication_error")
+    return None
+
+
 @app.get("/healthz")
 def healthz():
-    return {"status": "ok"}
+    return {"status": "ok", "client_loaded": _client is not None}
 
 
 @app.get("/v1/models")
@@ -308,9 +321,40 @@ def list_models():
     }
 
 
+@app.get("/v1/models/{model_id}")
+@app.get("/api/v1/models/{model_id}")
+def get_model(model_id: str):
+    name = resolve_alias(model_id)
+    if not is_known_model(name):
+        return _error(
+            f"The model `{model_id}` does not exist. Available models: "
+            f"{', '.join(MODEL_MAP)}",
+            status=404, err_type="model_not_found",
+        )
+    return {
+        "id": name,
+        "object": "model",
+        "created": int(time.time()),
+        "owned_by": "deepseek",
+    }
+
+
+@app.post("/v1/embeddings")
+@app.post("/api/v1/embeddings")
+def embeddings():
+    return _error(
+        "Embeddings are not supported by the DeepSeek chat web interface.",
+        status=501, err_type="not_implemented",
+    )
+
+
 @app.post("/v1/chat/completions")
 @app.post("/api/v1/chat/completions")
-async def chat_completions(req: ChatCompletionRequest):
+async def chat_completions(req: ChatCompletionRequest, request: Request):
+    auth_err = _check_auth(request)
+    if auth_err:
+        return auth_err
+
     if not req.messages:
         return _error("`messages` must not be empty", status=400, err_type="invalid_request_error")
 
@@ -537,6 +581,7 @@ async def chat_completions(req: ChatCompletionRequest):
                     first = None
                 if first is not None:
                     stream = _Replayed(stream, peeked, first)
+                include_usage = bool(req.stream_options and req.stream_options.get("include_usage"))
                 yield from stream_chunks(
                     req.model, stream,
                     on_done=lambda t, c, cs: remember(t, c, streamed=True,
@@ -548,6 +593,8 @@ async def chat_completions(req: ChatCompletionRequest):
                     on_turn=lambda cs, t: debuglog.log_turn(
                         cs, t, len(req.tools or []),
                         declared_tool_names(req.tools)),
+                    include_usage=include_usage,
+                    prompt_text=prompt,
                 )
             except Exception as e:
                 # Headers are already sent, so the failure has to travel as an
@@ -566,7 +613,15 @@ async def chat_completions(req: ChatCompletionRequest):
                 yield f"data: {json.dumps({'error': err})}\n\n"
                 yield "data: [DONE]\n\n"
 
-        return StreamingResponse(gen(), media_type="text/event-stream")
+        return StreamingResponse(
+            gen(),
+            media_type="text/event-stream",
+            headers={
+                "Cache-Control": "no-cache",
+                "Connection": "keep-alive",
+                "X-Accel-Buffering": "no",
+            },
+        )
 
     def run_chat():
         return client.chat(prompt, conversation_id, model_type,

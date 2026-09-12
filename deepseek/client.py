@@ -24,12 +24,21 @@ from __future__ import annotations
 import json
 import logging
 import os
+import random
+import re
 import threading
 import time
 from dataclasses import dataclass
 from typing import Iterator, Optional
 
 import httpx
+
+try:
+    from curl_cffi import requests as curl_requests
+    from curl_cffi.curl import CurlMime
+except ImportError:
+    curl_requests = None
+    CurlMime = None
 
 from .auth import Session, get_session
 from .pow import DeepSeekPow
@@ -66,6 +75,21 @@ QUEUE_TIMEOUT = float(os.getenv("DEEPSEEK_QUEUE_TIMEOUT", "45"))
 PACE_FIRST_DELAY = float(os.getenv("DEEPSEEK_PACE_FIRST_DELAY", "3"))
 PACE_MAX_DELAY = float(os.getenv("DEEPSEEK_PACE_MAX_DELAY", "30"))
 
+# Human simulation / stealth mode adds randomized reading/thinking delays
+# between conversation turns to mirror normal user cadence.
+STEALTH_MODE = os.getenv("STEALTH_MODE", "0").lower() in ("1", "true", "yes")
+STEALTH_MIN_DELAY = float(os.getenv("STEALTH_MIN_DELAY", "2.0"))
+STEALTH_MAX_DELAY = float(os.getenv("STEALTH_MAX_DELAY", "6.0"))
+
+# Upstream proxy for routing outbound traffic through residential / home nodes
+UPSTREAM_PROXY = os.getenv("UPSTREAM_PROXY") or None
+
+# Proof-of-work (PoW) simulated V8 execution and dispatch latency
+SIMULATE_POW_LATENCY = os.getenv("SIMULATE_POW_LATENCY", "1").lower() in ("1", "true", "yes")
+
+# Explicit toggle to use curl_cffi Chrome impersonation (default enabled if installed)
+USE_CURL_CFFI = os.getenv("USE_CURL_CFFI", "1").lower() in ("1", "true", "yes")
+
 
 class _Pacer:
     """Keeps a minimum gap between upstream requests, sized by recent throttling.
@@ -87,19 +111,24 @@ class _Pacer:
     def gap(self) -> float:
         return self._gap
 
-    def reserve(self) -> float:
+    def reserve(self, is_new_turn: bool = False) -> float:
         """Claim the next slot; returns how long the caller should wait."""
         with self._lock:
             now = time.time()
+            stealth_delay = 0.0
+            if STEALTH_MODE and is_new_turn:
+                stealth_delay = random.uniform(STEALTH_MIN_DELAY, STEALTH_MAX_DELAY)
+            effective_gap = max(self._gap, stealth_delay)
             start = max(now, self._next_at)
-            self._next_at = start + self._gap
+            self._next_at = start + effective_gap
             return max(0.0, start - now)
 
-    def wait(self) -> None:
-        delay = self.reserve()
+    def wait(self, is_new_turn: bool = False) -> None:
+        delay = self.reserve(is_new_turn=is_new_turn)
         if delay > 0:
             _log.info("pacing: waiting %.1fs before the next request "
-                      "(gap is %.1fs after recent throttling)", delay, self._gap)
+                      "(gap is %.1fs after recent throttling%s)", delay, self._gap,
+                      ", stealth pacing active" if STEALTH_MODE else "")
             time.sleep(delay)
 
     def on_success(self) -> None:
@@ -222,16 +251,39 @@ def _biz(data: dict) -> dict:
     return biz
 
 
+def _client_hints(ua: str) -> dict:
+    """Generate Sec-CH-UA and Sec-Fetch headers consistent with user agent."""
+    match = re.search(r"Chrome/(\d+)", ua)
+    major = match.group(1) if match else "131"
+    platform = '"Windows"'
+    if "Linux" in ua:
+        platform = '"Linux"'
+    elif "Macintosh" in ua or "Mac OS X" in ua:
+        platform = '"macOS"'
+
+    return {
+        "sec-ch-ua": f'"Chromium";v="{major}", "Google Chrome";v="{major}", "Not=A?Brand";v="24"',
+        "sec-ch-ua-mobile": "?0",
+        "sec-ch-ua-platform": platform,
+        "sec-fetch-dest": "empty",
+        "sec-fetch-mode": "cors",
+        "sec-fetch-site": "same-origin",
+        "accept-language": os.getenv("DEEPSEEK_ACCEPT_LANGUAGE", "en-US,en;q=0.9"),
+    }
+
+
 class DeepSeekClient:
     def __init__(
         self,
         session: Optional[Session] = None,
         allow_interactive: bool = True,
+        force_refresh: bool = False,
     ):
         # `allow_interactive=False` makes session resolution non-blocking: it
         # uses a cached/headless session and raises LoginRequired instead of
         # opening a browser window. The server passes False (see server/api.py).
-        self.session = session or get_session(allow_interactive=allow_interactive)
+        self.session = session or get_session(allow_interactive=allow_interactive,
+                                             force_refresh=force_refresh)
         self._pow = DeepSeekPow()
         # The wasmtime Store behind the PoW solver is not reentrant; serialise
         # access so concurrent server requests don't corrupt it.
@@ -243,32 +295,92 @@ class DeepSeekClient:
         self._inflight = 0
         self._progress_ts = time.time()
         self._state_lock = threading.Lock()
-        self._http = httpx.Client(
-            base_url=BASE,
-            headers=self._base_headers(),
-            cookies=self.session.cookies,
-            # `pool` bounds how long a request may wait for a free connection —
-            # without it a wedged connection pool blocks callers forever.
-            timeout=httpx.Timeout(connect=30.0, read=300.0, write=120.0, pool=30.0),
-        )
+
+        proxies = None
+        if UPSTREAM_PROXY:
+            proxies = {"http": UPSTREAM_PROXY, "https": UPSTREAM_PROXY}
+
+        self._use_curl = False
+        if curl_requests is not None and USE_CURL_CFFI:
+            try:
+                self._http = curl_requests.Session(
+                    base_url=BASE,
+                    impersonate="chrome131",
+                    headers=self._base_headers(),
+                    cookies=self.session.cookies,
+                    proxies=proxies,
+                    timeout=60,
+                )
+                self._use_curl = True
+                _log.info("Using curl_cffi transport impersonating Chrome 131 (BoringSSL/HTTP2)")
+            except Exception as e:
+                _log.warning("curl_cffi initialization failed, falling back to httpx: %s", e)
+
+        if not self._use_curl:
+            http2_enabled = False
+            try:
+                import h2  # noqa: F401
+                http2_enabled = True
+            except ImportError:
+                _log.warning("h2 package not found; falling back to HTTP/1.1")
+
+            self._http = httpx.Client(
+                base_url=BASE,
+                http2=http2_enabled,
+                headers=self._base_headers(),
+                cookies=self.session.cookies,
+                proxy=UPSTREAM_PROXY,
+                # `pool` bounds how long a request may wait for a free connection —
+                # without it a wedged connection pool blocks callers forever.
+                timeout=httpx.Timeout(connect=30.0, read=300.0, write=120.0, pool=30.0),
+            )
+
+    def sync_cookies(self) -> None:
+        """Sync updated cookies (e.g. fresh WAF or session cookies) back to the session file."""
+        try:
+            current = {}
+            if hasattr(self._http, "cookies"):
+                if hasattr(self._http.cookies, "items"):
+                    current = dict(self._http.cookies.items())
+                else:
+                    current = dict(self._http.cookies)
+            if current and any(self.session.cookies.get(k) != v for k, v in current.items()):
+                self.session.cookies.update(current)
+                self.session.save()
+        except Exception as e:
+            _log.debug("could not sync cookies: %s", e)
+
+    def _simulate_thread_navigation(self, chat_session_id: str) -> None:
+        """Emulate web UI loading conversation history prior to submitting a turn."""
+        try:
+            self._http.get(
+                "/api/v0/chat/history_messages",
+                params={"chat_session_id": chat_session_id},
+                timeout=10,
+            )
+        except Exception as e:
+            _log.debug("thread navigation simulation skipped: %s", e)
 
     def _base_headers(self) -> dict:
         # No content-type here: httpx derives it per request (application/json
         # for `json=` bodies, multipart with boundary for `files=` uploads); a
         # fixed client-level value would break the multipart file upload.
-        return {
+        ua = self.session.user_agent or "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"
+        headers = {
             "authorization": f"Bearer {self.session.token}",
             "accept": "*/*",
-            "user-agent": self.session.user_agent,
+            "user-agent": ua,
             "origin": BASE,
             "referer": f"{BASE}/",
             "x-app-version": "2.0.0",
             "x-client-version": "2.0.0",
             "x-client-platform": "web",
-            "x-client-locale": "en_US",
+            "x-client-locale": os.getenv("DEEPSEEK_LOCALE", "en_US"),
             "x-client-bundle-id": "com.deepseek.chat",
-            "x-client-timezone-offset": "19800",
+            "x-client-timezone-offset": os.getenv("DEEPSEEK_TIMEZONE_OFFSET", "19800"),
         }
+        headers.update(_client_hints(ua))
+        return headers
 
     # --- protocol steps -----------------------------------------------------
 
@@ -283,8 +395,20 @@ class DeepSeekClient:
         )
         r.raise_for_status()
         challenge = _biz(r.json())["challenge"]
+
+        t0 = time.perf_counter()
         with self._pow_lock:
-            return self._pow.make_header(challenge)
+            header = self._pow.make_header(challenge)
+        elapsed = time.perf_counter() - t0
+
+        if SIMULATE_POW_LATENCY:
+            # Emulate browser V8 execution and microtask dispatch latency (120ms to 320ms)
+            target_delay = max(0.12, min(0.32, random.gauss(0.19, 0.04)))
+            remaining = target_delay - elapsed
+            if remaining > 0:
+                time.sleep(remaining)
+
+        return header
 
     # --- public API ---------------------------------------------------------
 
@@ -297,9 +421,13 @@ class DeepSeekClient:
         because a completion referencing an unparsed file is rejected.
         """
         headers = {"x-ds-pow-response": self._pow_header(UPLOAD_PATH)}
-        r = self._http.post(
-            UPLOAD_PATH, files={"file": (filename, data, mime)}, headers=headers
-        )
+        if getattr(self, "_use_curl", False) and CurlMime is not None:
+            mp = CurlMime.from_list([{"name": "file", "filename": filename, "data": data, "content_type": mime}])
+            r = self._http.post(UPLOAD_PATH, multipart=mp, headers=headers)
+        else:
+            r = self._http.post(
+                UPLOAD_PATH, files={"file": (filename, data, mime)}, headers=headers
+            )
         r.raise_for_status()
         file_id = _biz(r.json())["id"]
 
@@ -408,6 +536,12 @@ class DeepSeekClient:
         """
         return max(5, int(self._pacer.gap + 0.999))
 
+    def check_session(self) -> dict:
+        """Fetch current user profile to verify session health and generate auxiliary app telemetry."""
+        r = self._http.get("/api/v0/users/current")
+        r.raise_for_status()
+        return r.json()
+
     def close(self) -> None:
         self._http.close()
 
@@ -454,11 +588,15 @@ class _Stream:
         finally:
             self._client._touch(-1)
             self._client._gate.release()
+            self._client.sync_cookies()
 
     def _attempt(self, meta: dict) -> Iterator[tuple]:
         """One completion request; yields its events and fills `meta`."""
         if self._session_id is None:
             self._session_id = self._client.create_chat_session()
+        else:
+            # Resuming thread: simulate authentic browser UI loading history prior to sending turn
+            self._client._simulate_thread_navigation(self._session_id)
         body = {
             "chat_session_id": self._session_id,
             "parent_message_id": self._parent_id,
@@ -474,11 +612,22 @@ class _Stream:
             body["model_type"] = self._model
         # PoW challenges are short-lived, so solve right before the request.
         headers = {"x-ds-pow-response": self._client._pow_header()}
-        with self._client._http.stream(
-            "POST", COMPLETION_PATH, json=body, headers=headers
-        ) as resp:
+        if getattr(self._client, "_use_curl", False):
+            resp = self._client._http.post(
+                COMPLETION_PATH,
+                json=body,
+                headers=headers,
+                stream=True,
+                timeout=300,
+            )
             resp.raise_for_status()
             yield from _parse_sse(resp.iter_lines(), meta)
+        else:
+            with self._client._http.stream(
+                "POST", COMPLETION_PATH, json=body, headers=headers
+            ) as resp:
+                resp.raise_for_status()
+                yield from _parse_sse(resp.iter_lines(), meta)
 
     def _log_summary(self, meta: dict, seen: dict, started: float,
                      attempt: int) -> None:
@@ -508,7 +657,7 @@ class _Stream:
         meta: dict = {}
         emitted = False
         pacer = self._client._pacer
-        pacer.wait()
+        pacer.wait(is_new_turn=True)
         started = time.time()
         seen: dict = {}
         try:
@@ -638,6 +787,8 @@ def _parse_sse(lines, meta: Optional[dict] = None) -> Iterator[tuple]:
     snapshot_seen = False
 
     for line in lines:
+        if isinstance(line, bytes):
+            line = line.decode("utf-8", errors="replace")
         if not line:
             continue
         if not line.startswith("data:"):

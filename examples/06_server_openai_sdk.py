@@ -25,21 +25,22 @@ completion = client.chat.completions.create(
     # model picks WHICH model answers: deepseek-chat (fast) or deepseek-expert
     # (stronger, slower). thinking (DeepThink) and search (web) are independent
     # toggles; they ride in extra_body, since they're outside OpenAI's schema.
-    model="deepseek-expert",
-    messages=[{"role": "system", "content" : "You are a helpful agent who always replies in Hindi"}, {"role": "user", "content": "what is better macbook or framework."}],
-    extra_body={"thinking": True, "search": True, "conversation_id" : "320ab157-cf58-4074-9869-27dc1bcccf78:2"},   # also: "search": True for web search
+    model="deepseek-chat",
+    messages=[{"role": "user", "content": "My name is Ada. Remember it and say hello."}],
+    extra_body={"thinking": False, "search": False},
 )
-print(completion.choices[0].message.content)
+print("Turn 1 Reply:\n", completion.choices[0].message.content)
 
 # conversation_id is outside OpenAI's schema, so the SDK keeps it in model_extra.
 extra = getattr(completion, "model_extra", None) or {}
 cid = extra.get("conversation_id")
-print("conversation_id:", cid)
+print("\nconversation_id:", cid)
 
-# To continue that conversation, send the id back via extra_body too:
-#
-#   client.chat.completions.create(
-#       model="deepseek-expert",
-#       messages=[{"role": "user", "content": "What's my name?"}],
-#       extra_body={"conversation_id": cid, "thinking": True},
-#   )
+# Turn 2 — continue that conversation by sending the id back via extra_body:
+if cid:
+    turn2 = client.chat.completions.create(
+        model="deepseek-chat",
+        messages=[{"role": "user", "content": "What was my name? Just the name."}],
+        extra_body={"conversation_id": cid},
+    )
+    print("\nTurn 2 Reply:\n", turn2.choices[0].message.content)

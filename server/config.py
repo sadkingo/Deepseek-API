@@ -5,6 +5,21 @@ import os
 # Requests per minute allowed per client IP (override with RATE_LIMIT_PER_MINUTE).
 RATE_LIMIT_PER_MINUTE = int(os.getenv("RATE_LIMIT_PER_MINUTE", "30"))
 
+# Optional API key authentication. When set, requests under /v1 must carry
+# an Authorization: Bearer <key> header matching this value. When empty/unset,
+# the server remains open without authentication (default).
+API_KEY = os.getenv("API_KEY") or os.getenv("DEEPSEEK_API_KEY") or None
+
+# Optional upstream proxy (e.g. socks5://127.0.0.1:1080 or http://user:pass@host:port)
+UPSTREAM_PROXY = os.getenv("UPSTREAM_PROXY") or None
+
+# Background AWS WAF token refresher (runs headless Playwright every N seconds to keep token fresh)
+ENABLE_WAF_SIDECAR = os.getenv("ENABLE_WAF_SIDECAR", "0").lower() in ("1", "true", "yes")
+WAF_REFRESH_INTERVAL = int(os.getenv("WAF_REFRESH_INTERVAL", "2400"))
+
+# Proof-of-work (PoW) latency emulation: simulates realistic browser V8 execution delay
+SIMULATE_POW_LATENCY = os.getenv("SIMULATE_POW_LATENCY", "1").lower() in ("1", "true", "yes")
+
 # Origins allowed to call this API from a browser page, comma-separated, e.g.
 # "https://app.example.com". Empty (the default) sends no CORS headers at all.
 # "*" allows any site — convenient for testing, but note this server has no
