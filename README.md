@@ -475,19 +475,36 @@ yourself.
 
 ### A conversation replayed from scratch
 
-Threads are found by fingerprinting the history the client resends. The
-fingerprint deliberately ignores the assistant's own prose and uses its tool
-calls instead: that text is our output coming back, and a client may reshape it
-— Zed returns assistant turns as a list of parts that includes the model's
-*reasoning* next to the reply, so what comes back is not what we sent. Matching
-on it meant no thread was ever found. If one turn
-does not match — a reply the client reworded, a turn that failed and was
-retried — the lookup walks back to the longest prefix it does recognise and
-sends only the messages since, instead of giving up and flattening the whole
-conversation into one prompt. That mattered in practice: a 17-message agentic
+Threads are found by fingerprinting the history the client resends, and the
+fingerprint is deliberately loose about the parts frontends rewrite between
+turns:
+
+- **The assistant's own prose is ignored; its tool calls are used instead.**
+  That text is our output coming back, and a client may reshape it — Zed
+  returns assistant turns as a list of parts that includes the model's
+  *reasoning* next to the reply, so what comes back is not what we sent.
+- **The system prompt counts only by its opening** (the first 300 characters).
+  Roleplay frontends rebuild it every turn — lore entries injected by keyword,
+  notes that come and go — so its full text never matched twice, and the
+  same chat started a new DeepSeek thread on every single message.
+- **A note appended to the outgoing message is tolerated.** SillyTavern-style
+  clients tack a `SYSTEM NOTE: ...` paragraph onto the newest user message,
+  then resend that message *without* it as history. A turn matches when the
+  text we answered equals the resent one or only extends it by whole
+  paragraphs.
+
+If one turn still does not match — a reply the client reworded, a turn that
+failed and was retried — the lookup walks back to the longest prefix it does
+recognise and sends only the messages since, instead of giving up and
+flattening the whole conversation into one prompt. Regenerating a reply resumes
+from the message *before* it, so DeepSeek branches the thread rather than
+seeing the conversation twice. That mattered in practice: a 17-message agentic
 session collapsed into a 94,000-character prompt, and a model handed a
 structureless transcript imitates it — describing a change in prose the way the
 earlier replies did, rather than calling a tool.
+
+The index is saved to `session/threads.json` (`THREADS_FILE` to relocate), so
+restarting the server keeps conversations on their threads.
 
 When there is genuinely nothing to resume, the flattened prompt ends with a
 `[NOW]` block naming the request still to be carried out, so the model has a

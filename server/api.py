@@ -66,7 +66,7 @@ from .openai_format import (
     tools_reminder,
     user_labels,
 )
-from .threads import ThreadCache, history_key
+from .threads import ThreadCache, TurnIndex
 from .ratelimit import RateLimiter, install_rate_limit
 from .schemas import ChatCompletionRequest
 
@@ -102,8 +102,12 @@ _client: DeepSeekClient | None = None
 _client_lock = threading.Lock()
 
 # Lets a resent OpenAI history resume its DeepSeek thread instead of being
-# replayed as a transcript. See server/threads.py.
-_threads = ThreadCache()
+# replayed as a transcript. See server/threads.py. Saved next to the session
+# so a restart does not turn every open conversation into a fresh thread
+# (THREADS_FILE overrides the location).
+_threads = TurnIndex(path=os.getenv(
+    "THREADS_FILE",
+    str(Path(__file__).resolve().parent.parent / "session" / "threads.json")))
 
 # Which tool set each DeepSeek thread has been taught, keyed by chat session.
 # The protocol preamble is expensive to repeat and confusing to repeat wrongly,
@@ -312,11 +316,7 @@ async def chat_completions(req: ChatCompletionRequest):
     conversation_id = req.conversation_id
     resume_from = len(history) - 1  # messages from here on are new to the thread
     if conversation_id is None:
-        for cut in range(len(history) - 1, 0, -1):
-            found = _threads.get(history_key(history[:cut]))
-            if found:
-                conversation_id, resume_from = found, cut
-                break
+        conversation_id, resume_from = _threads.find(history)
 
     # Only ever announce tools the caller actually declared for this request.
     tools_fp = tools_fingerprint(req.tools)
@@ -402,8 +402,7 @@ async def chat_completions(req: ChatCompletionRequest):
         if cid:
             fingerprint = "\n".join(serialize_tool_call(n, a)
                                      for n, a in (calls or []))
-            _threads.put(
-                history_key(list(history) + [("assistant", fingerprint)]), cid)
+            _threads.remember(history, fingerprint, cid)
             if tools_fp:
                 # This thread has now seen these tools; later turns need not
                 # repeat the preamble unless the set changes again.

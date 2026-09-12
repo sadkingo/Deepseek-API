@@ -1367,12 +1367,36 @@ def assistant_fingerprint(tool_calls) -> str:
     )
 
 
+# How much of a system message is fingerprinted. Roleplay frontends rewrite the
+# system prompt every turn (lore entries injected by keyword, a note that
+# comes and goes), so its full text would never match twice; its opening — the
+# character card, the assistant's instructions — is what identifies the
+# conversation.
+_SYSTEM_HEAD = 300
+
+
+def _norm_lines(text: str) -> str:
+    """Normal form for fingerprinting: stripped lines, blanks dropped."""
+    return "\n".join(l.strip() for l in text.splitlines() if l.strip())
+
+
 def message_texts(messages: List[ChatMessage]) -> List[Tuple[str, str]]:
-    """The (role, text) pairs of a request, for thread fingerprinting."""
-    return [(m.role,
-             assistant_fingerprint(m.tool_calls) if m.role == "assistant"
-             else _canonical_text(m))
-            for m in messages]
+    """The (role, text) pairs of a request, for thread fingerprinting.
+
+    Assistant turns contribute only their tool calls (`assistant_fingerprint`),
+    system turns only their opening (`_SYSTEM_HEAD` characters), user and tool
+    turns their whole text in `_norm_lines` form — the form `TurnIndex` relies
+    on to tell an appended note from a different message.
+    """
+    out = []
+    for m in messages:
+        if m.role == "assistant":
+            out.append((m.role, assistant_fingerprint(m.tool_calls)))
+        elif m.role == "system":
+            out.append((m.role, " ".join(_text_of(m.content).split())[:_SYSTEM_HEAD]))
+        else:
+            out.append((m.role, _norm_lines(_canonical_text(m))))
+    return out
 
 
 def flatten_directive(messages: List[ChatMessage]) -> str:
