@@ -38,6 +38,17 @@ DEFAULT_SESSION_FILE = ROOT / "session" / "session.json"
 CHAT_URL = "https://chat.deepseek.com/"
 SIGNIN_URL = "https://chat.deepseek.com/sign_in"
 
+# Where the LAST registered account's email/password live, for signing back in
+# automatically when DeepSeek invalidates the token. DEEPSEEK_EMAIL /
+# DEEPSEEK_PASSWORD in this process's environment win; otherwise they are read
+# from the sign-up automation's .env, which it keeps pointed at the newest
+# account (override the path with ACCOUNT_ENV_FILE).
+DEFAULT_ACCOUNT_ENV = Path(os.getenv(
+    "ACCOUNT_ENV_FILE",
+    Path.home() / "Desktop" / "Create account deepseek" / ".env"))
+# How long a visible login window waits for a token before giving up.
+LOGIN_TIMEOUT = int(os.getenv("LOGIN_TIMEOUT", "300"))
+
 LAUNCH_ARGS = ["--disable-blink-features=AutomationControlled"]
 # Token is trusted for this long before we refresh it from the browser again.
 SESSION_MAX_AGE = 6 * 60 * 60  # 6 hours
@@ -84,6 +95,40 @@ class Session:
             return cls(**json.loads(path.read_text(encoding="utf-8")))
         except Exception:
             return None
+
+
+# --- account credentials ------------------------------------------------------
+
+def _read_env_file(path: Path) -> Dict[str, str]:
+    out: Dict[str, str] = {}
+    try:
+        for line in path.read_text(encoding="utf-8").splitlines():
+            line = line.strip()
+            if not line or line.startswith("#") or "=" not in line:
+                continue
+            k, _, v = line.partition("=")
+            out[k.strip()] = v.strip().strip('"').strip("'")
+    except OSError:
+        pass
+    return out
+
+
+def load_account_credentials(env_file: Path = DEFAULT_ACCOUNT_ENV) -> Optional[tuple]:
+    """(email, password) of the account to sign in with, or None if unknown."""
+    email = os.getenv("DEEPSEEK_EMAIL", "").strip()
+    password = os.getenv("DEEPSEEK_PASSWORD", "")
+    if not (email and password):
+        env = _read_env_file(env_file)
+        email = email or env.get("DEEPSEEK_EMAIL", "").strip()
+        password = password or env.get("DEEPSEEK_PASSWORD", "")
+    if email and password:
+        return email, password
+    return None
+
+
+def mask_email(email: str) -> str:
+    user, _, domain = email.partition("@")
+    return f"{user[:2]}***@{domain}" if domain else "***"
 
 
 # --- in-page helpers --------------------------------------------------------
@@ -140,6 +185,67 @@ def _wait_for_token(page, timeout: float) -> Optional[str]:
     return None
 
 
+def _first_visible(page, selectors):
+    """The first selector that matches a visible element, or None."""
+    for sel in selectors:
+        try:
+            loc = page.locator(sel).first
+            if loc.count() and loc.is_visible():
+                return loc
+        except Exception:
+            continue
+    return None
+
+
+_EMAIL_FIELDS = (
+    'input[placeholder*="email" i]', 'input[placeholder*="Email" i]',
+    'input[type="email"]', 'input[type="text"]:not([type="password"])',
+)
+_PASSWORD_FIELDS = ('input[type="password"]', 'input[placeholder*="assword"]')
+# The primary "Log in" first: "Log in with Google" contains the same text.
+_LOGIN_BUTTONS = (
+    '.ds-button--primary:has-text("Log in")',
+    'div[role="button"]:has-text("Log in")', '.ds-button:has-text("Log in")',
+    'button:has-text("Log in")', 'div[role="button"]:has-text("Sign in")',
+    'button:has-text("Sign in")', 'div[role="button"]:has-text("登录")',
+)
+
+
+def _autofill_login(page, email: str, password: str) -> bool:
+    """Best effort: type the credentials into the sign-in form and submit.
+
+    Returns True if the form was submitted. Anything that does not look as
+    expected just leaves the window for the user to finish by hand; the token
+    poll afterwards is what decides success.
+    """
+    try:
+        email_box = _first_visible(page, _EMAIL_FIELDS)
+        pw_box = _first_visible(page, _PASSWORD_FIELDS)
+        if email_box is None or pw_box is None:
+            return False
+        email_box.click()
+        email_box.fill(email)
+        pw_box.click()
+        pw_box.fill(password)
+        # The terms checkbox, if it is a real one and unticked.
+        try:
+            box = page.locator('input[type="checkbox"]').first
+            if box.count() and not box.is_checked():
+                box.check(force=True)
+        except Exception:
+            pass
+        button = _first_visible(page, _LOGIN_BUTTONS)
+        if button is not None:
+            button.click()
+        else:
+            pw_box.press("Enter")
+        return True
+    except Exception as e:
+        print(f"[auth] could not fill the sign-in form automatically ({e}); "
+              "please sign in in the window.")
+        return False
+
+
 def _safe_goto(page, url: str) -> None:
     """Navigate, tolerating the benign `net::ERR_ABORTED` that DeepSeek's SPA
     redirects and the AWS WAF check often raise mid-navigation. We wait only for
@@ -158,11 +264,16 @@ def login(
     profile_dir: Path = DEFAULT_PROFILE_DIR,
     headless: bool = False,
     assume_logged_out: bool = False,
+    credentials: Optional[tuple] = None,
 ) -> Session:
     """Interactive login. Opens a visible window and waits for you to sign in by
     hand (and clear the AWS WAF human-check); once a token appears it captures
     and saves the session. The persistent profile means later `get_session()`
     calls capture the token headlessly without a window.
+
+    With `credentials` — (email, password), defaulting to the last registered
+    account (`load_account_credentials`) — the form is filled in and submitted
+    automatically; the window is still shown so a human-check can be solved.
 
     `assume_logged_out=True` skips the initial "are we already signed in?" hop to
     CHAT_URL and goes straight to the sign-in page. Callers that have just
@@ -190,9 +301,16 @@ def login(
 
         if not existing:
             _safe_goto(page, SIGNIN_URL)
-            print("[auth] Please sign in in the window (solve the human-check if "
-                  "shown). Waiting for the session...")
-            if not _wait_for_token(page, timeout=300):
+            if credentials is None:
+                credentials = load_account_credentials()
+            if credentials and _autofill_login(page, *credentials):
+                print(f"[auth] Signing in as {mask_email(credentials[0])} "
+                      "automatically — solve the human-check in the window if "
+                      "one appears. Waiting for the session...")
+            else:
+                print("[auth] Please sign in in the window (solve the human-check "
+                      "if shown). Waiting for the session...")
+            if not _wait_for_token(page, timeout=LOGIN_TIMEOUT):
                 context.close()
                 raise RuntimeError("Login timed out — no token captured.")
 
@@ -264,6 +382,32 @@ def get_session(
     # happens once — later calls capture the token headlessly. We just confirmed
     # (above) there's no token, so go straight to the sign-in page.
     print("[auth] No valid session found — opening a browser window to log in...")
+    return login(profile_dir=profile_dir, assume_logged_out=True)
+
+
+def relogin(
+    bad_token: Optional[str] = None,
+    profile_dir: Path = DEFAULT_PROFILE_DIR,
+    allow_interactive: bool = True,
+) -> Session:
+    """Get a NEW session after DeepSeek rejected the current token.
+
+    First a headless capture from the profile, in case the browser session is
+    still alive and merely holds a newer token; a capture that hands back the
+    very token that was just rejected counts as signed out. Then, if allowed,
+    a visible window signed in automatically with the last account's
+    credentials (see `login`). Raises `LoginRequired` when interactive login
+    is disallowed and nothing else worked.
+    """
+    session = _headless_refresh(profile_dir)
+    if session is not None and session.token != bad_token:
+        return session
+    if not allow_interactive:
+        raise LoginRequired(
+            "DeepSeek rejected the saved token and no signed-in browser "
+            "profile was found. Log in again with:\n    python -m deepseek.auth")
+    print("[auth] DeepSeek rejected the token — opening a browser window to "
+          "sign in again...")
     return login(profile_dir=profile_dir, assume_logged_out=True)
 
 

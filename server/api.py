@@ -38,7 +38,7 @@ from starlette.concurrency import run_in_threadpool
 from starlette.requests import Request
 
 from . import debuglog
-from deepseek.auth import LoginRequired
+from deepseek.auth import LoginRequired, relogin
 from deepseek.client import DeepSeekClient, RateLimited, ServerBusy
 
 from .config import (
@@ -172,6 +172,59 @@ def get_client(force_refresh: bool = False) -> DeepSeekClient:
                 _client = DeepSeekClient(allow_interactive=SERVER_INTERACTIVE_LOGIN,
                                          force_refresh=force_refresh)
     return _client
+
+
+# DeepSeek invalidates tokens — the web app signed out, the account signed in
+# elsewhere, a password change. Every request then fails with "Authorization
+# Failed (invalid token)" until someone logs in again. So the server does it
+# itself: a visible browser window signed in with the last account's
+# credentials (see deepseek.auth.relogin), the client rebuilt around the new
+# session, and the failed request retried — once.
+_relogin_lock = threading.Lock()
+_relogin_failed_at = 0.0
+RELOGIN_COOLDOWN = 60.0  # after a failed sign-in, do not retry for this long
+
+
+def _is_auth_failure(exc: Exception) -> bool:
+    text = str(exc).lower()
+    return ("authorization failed" in text or "invalid token" in text
+            or "token expired" in text or "not logged in" in text
+            or "401" in text and "unauthorized" in text)
+
+
+def _relogin_client(failed: DeepSeekClient) -> DeepSeekClient:
+    """Replace `failed`'s session with a freshly captured one.
+
+    Serialised: concurrent failures wait for the sign-in in progress and then
+    use its result instead of opening more windows. Raises LoginRequired (or
+    the sign-in's own error) when no new session could be obtained.
+    """
+    global _client, _relogin_failed_at
+    bad_token = getattr(getattr(failed, "session", None), "token", None)
+    with _relogin_lock:
+        current = _client
+        if current is not None and current is not failed and \
+                getattr(current.session, "token", None) != bad_token:
+            return current  # someone already signed in again
+        if time.time() - _relogin_failed_at < RELOGIN_COOLDOWN:
+            raise LoginRequired(
+                "DeepSeek rejected the saved token and the last sign-in "
+                "attempt failed; not retrying yet.")
+        debuglog.log_error("DeepSeek rejected the token — signing in again "
+                           "(a browser window may open)")
+        try:
+            session = relogin(bad_token=bad_token,
+                              allow_interactive=SERVER_INTERACTIVE_LOGIN)
+        except Exception as e:
+            _relogin_failed_at = time.time()
+            debuglog.log_error(f"sign-in failed: {e}")
+            raise
+        fresh = DeepSeekClient(session=session,
+                               allow_interactive=SERVER_INTERACTIVE_LOGIN)
+        with _client_lock:
+            _client = fresh
+        debuglog.log_error("signed in again; retrying the request")
+        return fresh
 
 
 def _watchdog() -> None:
@@ -555,16 +608,33 @@ async def chat_completions(req: ChatCompletionRequest, request: Request):
 
     if req.stream:
         def gen():
+            nonlocal client, account
             try:
                 files = upload_images()
-                stream = client.stream(
-                    prompt, conversation_id=conversation_id,
-                    model=model_type, thinking=thinking, search=req.search,
-                    ref_file_ids=files,
-                )
+
+                def open_stream():
+                    return client.stream(
+                        prompt, conversation_id=conversation_id,
+                        model=model_type, thinking=thinking, search=req.search,
+                        ref_file_ids=files,
+                    )
+
                 try:
-                    first = iter(stream.events())
-                    peeked = next(first, None)
+                    try:
+                        stream = open_stream()
+                        first = iter(stream.events())
+                        peeked = next(first, None)
+                    except Exception as e:
+                        if not _is_auth_failure(e):
+                            raise
+                        # Nothing has been sent yet, so the sign-in and the
+                        # retry stay invisible to the client.
+                        debuglog.log_error(f"upstream rejected the token ({e})")
+                        client = _relogin_client(client)
+                        account = _account_of(client)
+                        stream = open_stream()
+                        first = iter(stream.events())
+                        peeked = next(first, None)
                 except Exception as e:
                     if not _is_stale_thread(e):
                         raise
@@ -604,6 +674,8 @@ async def chat_completions(req: ChatCompletionRequest, request: Request):
                 # reads it can tell "back off" from "something broke".
                 if isinstance(e, RateLimited):
                     err = {"message": str(e), "type": "rate_limit_error"}
+                elif isinstance(e, LoginRequired):
+                    err = {"message": str(e), "type": "login_required"}
                 elif isinstance(e, ServerBusy):
                     err = {"message": str(e), "type": "overloaded_error"}
                 else:
@@ -632,9 +704,22 @@ async def chat_completions(req: ChatCompletionRequest, request: Request):
         return client.chat(fresh_prompt, None, resolve_model_type(req.model),
                            thinking, req.search, upload_images())
 
+    def run_chat_relogin():
+        """The token was rejected: sign in again, then the same turn again."""
+        nonlocal client, account
+        client = _relogin_client(client)
+        account = _account_of(client)
+        return run_chat()
+
     try:
         try:
-            reply = await run_in_threadpool(run_chat)
+            try:
+                reply = await run_in_threadpool(run_chat)
+            except Exception as e:
+                if not _is_auth_failure(e):
+                    raise
+                debuglog.log_error(f"upstream rejected the token ({e})")
+                reply = await run_in_threadpool(run_chat_relogin)
         except Exception as e:
             if not _is_stale_thread(e):
                 raise
@@ -642,6 +727,8 @@ async def chat_completions(req: ChatCompletionRequest, request: Request):
                 f"thread {conversation_id} is gone ({e}); starting a new one")
             _threads.forget(conversation_id)
             reply = await run_in_threadpool(run_chat_fresh)
+    except LoginRequired as e:
+        return _error(str(e), status=503, err_type="login_required")
     except RateLimited as e:
         # DeepSeek's own limit, not ours. 429 + Retry-After is what OpenAI
         # clients (and Zed) understand as "back off and try again".

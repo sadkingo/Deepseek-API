@@ -540,6 +540,23 @@ When there is genuinely nothing to resume, the flattened prompt ends with a
 `[NOW]` block naming the request still to be carried out, so the model has a
 present-tense instruction instead of a pattern to copy.
 
+### A rejected token
+
+DeepSeek invalidates a token now and then — the web app signed out, the
+account was used elsewhere, a password changed — and every request then fails
+with `Authorization Failed (invalid token)`. The server signs back in on its
+own: first a headless capture from the browser profile (the session may simply
+hold a newer token), otherwise a visible browser window on the sign-in page
+with the last account's email and password filled in and submitted. Solve the
+human-check in that window if one appears. The credentials are `DEEPSEEK_EMAIL`
+/ `DEEPSEEK_PASSWORD`, or else the sign-up automation's `.env`
+(`ACCOUNT_ENV_FILE`), which always points at the newest registered account.
+Once a session is captured the client is rebuilt and the failed request is
+retried — for streams before the first frame, so the caller sees nothing but
+a longer wait. Concurrent failures share one sign-in; a failed sign-in is not
+retried for a minute, and the callers get a `503 login_required` meanwhile.
+`python -m deepseek.auth` uses the same auto-fill.
+
 ### A thread that vanished
 
 DeepSeek prunes chat sessions. Resuming one that is gone fails with "invalid
