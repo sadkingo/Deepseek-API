@@ -759,7 +759,44 @@ def _fragment_kind(frag_type) -> Optional[str]:
     return _FRAGMENT_KINDS.get(frag_type, _DEFAULT_FRAGMENT_KIND)
 
 
+class UpstreamGaveUp(RuntimeError):
+    """DeepSeek accepted the request and then abandoned it.
+
+    Sent as an `event: hint` frame with `"type": "error"` after (typically)
+    60 seconds of heartbeats, e.g. "Server busy, please try again later." with
+    finish_reason "generation_timeout". Nothing was generated; the web UI shows
+    the message with a Retry button. Raised as its own type so callers can tell
+    "DeepSeek is overloaded" from "the proxy broke".
+    """
+
+
 def _parse_sse(lines, meta: Optional[dict] = None) -> Iterator[tuple]:
+    """See `_parse_sse_frames`; this wrapper adds forensics for empty streams.
+
+    When a stream closes without a single content event, the raw frames that
+    DID arrive (heartbeats excluded, bounded) are logged, so the next unknown
+    frame shape is a log line instead of an investigation.
+    """
+    raw: list = []
+
+    def tap():
+        for line in lines:
+            text = line.decode("utf-8", errors="replace") \
+                if isinstance(line, bytes) else line
+            if text and text.strip() != ":" and len(raw) < 20:
+                raw.append(text[:300])
+            yield text
+
+    produced = False
+    for event in _parse_sse_frames(tap(), meta):
+        produced = True
+        yield event
+    if not produced:
+        _log.warning("upstream stream closed without content; frames seen: %s",
+                     raw or "(none)")
+
+
+def _parse_sse_frames(lines, meta: Optional[dict] = None) -> Iterator[tuple]:
     """Turn DeepSeek's SSE completion stream into ("thinking"|"text", chunk) deltas.
 
     The stream sends an initial snapshot frame whose `v` is the full response
@@ -785,11 +822,15 @@ def _parse_sse(lines, meta: Optional[dict] = None) -> Iterator[tuple]:
     active_path: Optional[str] = None
     kind: Optional[str] = None  # event kind of the fragment appends target
     snapshot_seen = False
+    event_name: Optional[str] = None  # the `event:` line preceding a `data:`
 
     for line in lines:
         if isinstance(line, bytes):
             line = line.decode("utf-8", errors="replace")
         if not line:
+            continue
+        if line.startswith("event:"):
+            event_name = line[len("event:"):].strip()
             continue
         if not line.startswith("data:"):
             err = _biz_error(line)
@@ -803,6 +844,22 @@ def _parse_sse(lines, meta: Optional[dict] = None) -> Iterator[tuple]:
             obj = json.loads(payload)
         except json.JSONDecodeError:
             continue
+
+        # `event: hint` carries the web UI's notices. The one that matters is
+        # the error: DeepSeek held the request for ~60s of heartbeats, gave
+        # up, and will now `event: close` the stream with nothing generated.
+        # Without this the stream just looks empty, and the caller waits out
+        # a pointless retry before reporting a vague "no reply" two minutes on.
+        if event_name == "hint" or obj.get("type") == "error":
+            event_name = None
+            if obj.get("type") == "error":
+                reason = obj.get("finish_reason") or "error"
+                content = obj.get("content") or "no details"
+                _log.warning("upstream gave up: %s (%s)", content, reason)
+                raise UpstreamGaveUp(
+                    f"DeepSeek gave up on the request ({reason}): {content}")
+            continue
+        event_name = None
 
         # The `ready` frame names the assistant message before any content.
         if meta is not None and isinstance(obj.get("response_message_id"), int):

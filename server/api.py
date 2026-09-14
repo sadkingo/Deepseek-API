@@ -39,7 +39,8 @@ from starlette.requests import Request
 
 from . import debuglog
 from deepseek.auth import LoginRequired, relogin
-from deepseek.client import DeepSeekClient, RateLimited, ServerBusy
+from deepseek.client import (DeepSeekClient, RateLimited, ServerBusy,
+                             UpstreamGaveUp)
 
 from .config import (
     API_KEY,
@@ -676,7 +677,7 @@ async def chat_completions(req: ChatCompletionRequest, request: Request):
                     err = {"message": str(e), "type": "rate_limit_error"}
                 elif isinstance(e, LoginRequired):
                     err = {"message": str(e), "type": "login_required"}
-                elif isinstance(e, ServerBusy):
+                elif isinstance(e, (ServerBusy, UpstreamGaveUp)):
                     err = {"message": str(e), "type": "overloaded_error"}
                 else:
                     err = {"message": f"DeepSeek request failed: {e}",
@@ -734,7 +735,9 @@ async def chat_completions(req: ChatCompletionRequest, request: Request):
         # clients (and Zed) understand as "back off and try again".
         return _error(str(e), status=429, err_type="rate_limit_error",
                       retry_after=max(30, client.pace_hint()))
-    except ServerBusy as e:
+    except (ServerBusy, UpstreamGaveUp) as e:
+        # Ours or DeepSeek's, the server is overloaded either way; 503 tells
+        # the client to try again shortly rather than to change the request.
         return _error(str(e), status=503, err_type="overloaded_error")
     except Exception as e:
         return _error(f"DeepSeek request failed: {e}")
