@@ -1,13 +1,14 @@
 # Commands
 
-Three shortcuts do the everyday jobs. They work from any directory — each one
+Four shortcuts do the everyday jobs. They work from any directory — each one
 finds the project itself — and are defined as zsh functions in `~/.zshrc`
 pointing at the scripts in [bin/](bin/):
 
 | Command    | What it does                                        |
 | ---------- | --------------------------------------------------- |
 | `start`    | Run the API server (foreground; Ctrl-C stops it)    |
-| `register` | Sign in to DeepSeek again, as a different account   |
+| `login`    | Sign in to DeepSeek in a browser and save the session |
+| `register` | Create a fresh DeepSeek account automatically       |
 | `tunnel`   | Expose the local server on a public HTTPS URL       |
 
 To set them up on another machine, add this to `~/.zshrc` (or `~/.bashrc`) and
@@ -16,9 +17,13 @@ open a new terminal:
 ```bash
 export DEEPSEEK_API_DIR="$HOME/Desktop/Deepseek-API"
 start()    { "$DEEPSEEK_API_DIR/bin/start"    "$@" }
-register() { "$DEEPSEEK_API_DIR/bin/register" "$@" }
+login()    { "$DEEPSEEK_API_DIR/bin/login"    "$@" }
 tunnel()   { "$DEEPSEEK_API_DIR/bin/tunnel"   "$@" }
+register() { "$HOME/Desktop/Create account deepseek/bin/register" "$@" }
 ```
+
+`register` lives in the separate sign-up automation project, not in this repo;
+leave that line out if you do not have it.
 
 If the project lives somewhere else, change `DEEPSEEK_API_DIR` — that is the
 only path the shell config knows. The scripts can also be run directly, e.g.
@@ -41,20 +46,33 @@ Equivalent long form:
 cd ~/Desktop/Deepseek-API && source venv/bin/activate && python app.py
 ```
 
-## Log in with a different account
+## Log in
 
-**Discards the saved session**, then opens a browser to sign in again. Losing
-it costs only one sign-in, but any running server will need the new session, so
-restart it afterwards.
+Opens a browser window to sign in to DeepSeek by hand and saves the session
+that the server uses. Run it when there is no saved session yet (fresh
+checkout, or after `rm -rf session`) or to switch to a different account.
+**Discards the saved session first**, so the login window always appears.
+Losing it costs only one sign-in, but any running server will need the new
+session, so restart it afterwards.
 
 ```bash
-register
+login
 ```
 
 Equivalent long form:
 
 ```bash
 cd ~/Desktop/Deepseek-API && rm -rf session && source venv/bin/activate && python -m deepseek.auth
+```
+
+## Register a fresh account
+
+Creates a brand-new DeepSeek account automatically (SeleniumBase + Gmail) and
+saves its session into this project. This is the sign-up automation in
+`~/Desktop/Create account deepseek`, not part of this repo.
+
+```bash
+register
 ```
 
 ## Muted-account auto-recovery

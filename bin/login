@@ -1,0 +1,28 @@
+#!/usr/bin/env bash
+# Sign in to DeepSeek by hand in a browser window and save the session.
+#
+# Use this when there is no saved session (fresh checkout, or after deleting
+# session/) or to switch to a different account. Any saved session is
+# discarded first so the login window always appears rather than the cached
+# session being reused. Losing it costs only one browser sign-in, but it IS
+# discarded, so say so before doing it.
+#
+# Not to be confused with the global `register`, which creates a brand-new
+# account automatically (~/Desktop/Create account deepseek).
+set -euo pipefail
+
+cd "$(dirname "$(readlink -f "$0")")/.."
+
+if [ ! -x venv/bin/python ]; then
+    echo "No virtualenv at $(pwd)/venv — create it first:" >&2
+    echo "  python3 -m venv venv && venv/bin/pip install -r requirements.txt" >&2
+    exit 1
+fi
+
+if [ -e session ]; then
+    echo "Discarding the saved session in $(pwd)/session…"
+    rm -rf session
+fi
+
+echo "Opening a browser window — sign in to the DeepSeek account you want to use."
+exec venv/bin/python -m deepseek.auth "$@"
