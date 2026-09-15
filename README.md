@@ -536,19 +536,33 @@ This is deliberately loose about everything frontends rewrite between turns:
   fresh one, the dead threads are skipped and pruned instead of each costing
   a failed resume.
 
-**A refusal is a poisoned branch, not an answer.** When DeepSeek answers a
-turn with one of its canned refusals ("Sorry, that's beyond my current scope.
-Let's talk about something else.", "I am sorry, I cannot answer that
-question...") or the model declines to go on with a roleplay ("I'm not able to
-continue with this roleplay..."), the same branch keeps refusing whatever
-comes next, while the same conversation sent afresh usually gets a normal
-reply. So the reply is held back until it is clearly not a refusal — a few
-chunks, at most 400 characters — and a refused turn is re-sent, before the
-client sees anything, as an edit of the chat's first message carrying the
-whole history: a new branch from the chat's root, leaving the refusing branch
-behind. If that is refused as well, the refusal is delivered. The phrases are
-`DEEPSEEK_REFUSAL_TEXTS` ("|"-separated) and the length cap
-`DEEPSEEK_REFUSAL_MAX_LEN`.
+**A refusal is a poisoned branch, not an answer.** Once a chat branch has
+produced a refusal, everything sent after it on that branch is refused too,
+while the same conversation sent afresh usually gets a normal reply. Three
+things count as a refusal: DeepSeek's canned texts ("Sorry, that's beyond my
+current scope. Let's talk about something else.", "I am sorry, I cannot
+answer that question..."), the model declining in its own words (a short reply
+opening like "I'm not going to engage with this content" or "I'm not able to
+continue with this roleplay"; the wording varies, so the opening is matched as
+a pattern and the reply must be under 400 characters), and *moderation after
+the fact*: DeepSeek sometimes streams a whole reply and then replaces it with
+the canned text (status `CONTENT_FILTER`), so the client got the story while
+the chat shows a refusal. The recovery is always the same — the turn is sent
+as an **edit of the chat's first message**: the whole history as a new branch
+from the chat's root, leaving the refusing branch behind, with any refusals
+the client kept in its history left out of the replay:
+
+- A refusal that arrives as text is caught before the client sees anything
+  (the reply is held back for a few chunks, at most 400 characters) and the
+  turn is retried at the root immediately. A second refusal is delivered.
+- A refusal that only shows up after the reply streamed (moderation) marks
+  that state, and the *next* turn on it goes to the root instead. Because the
+  verdict can arrive after the stream ended, the chat's message listing that
+  is fetched before every resume is checked too: a parent that DeepSeek has
+  since marked `CONTENT_FILTER` is never continued, even across a restart.
+
+The canned phrases are `DEEPSEEK_REFUSAL_TEXTS` ("|"-separated) and the
+length cap `DEEPSEEK_REFUSAL_MAX_LEN`.
 
 **Injected notes are stated once, and never parroted.** Roleplay frontends
 append instruction lines to every outgoing message (`SYSTEM NOTE: Do not

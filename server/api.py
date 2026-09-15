@@ -25,6 +25,7 @@ import faulthandler
 import hashlib
 import json
 import os
+import re
 import signal
 import threading
 import time
@@ -39,8 +40,8 @@ from starlette.requests import Request
 
 from . import debuglog
 from deepseek.auth import LoginRequired, relogin
-from deepseek.client import (DeepSeekClient, RateLimited, ServerBusy,
-                             UpstreamGaveUp)
+from deepseek.client import (DeepSeekClient, PoisonedThread, RateLimited,
+                             ServerBusy, UpstreamGaveUp)
 
 from .config import (
     API_KEY,
@@ -282,6 +283,10 @@ class _Replayed:
     def request_message_id(self):
         return getattr(self._stream, "request_message_id", None)
 
+    @property
+    def content_filtered(self):
+        return getattr(self._stream, "content_filtered", False)
+
 
 # Refusals. A reply that opens with one of these and says little else is not
 # an answer to the message: once a chat branch has produced one, it keeps
@@ -311,10 +316,31 @@ def _norm(text: str) -> str:
     return " ".join(text.replace("’", "'").split()).lower()
 
 
+# How the model itself declines, in its own words. The wording varies ("I'm
+# not able to continue with this type of roleplay content", "I'm not going to
+# engage with this content", "I can't continue with that") so the opening is
+# matched as a pattern; the length cap keeps a reply that declines and then
+# goes on to answer out of it.
+_REFUSAL_OPENERS = re.compile(
+    r"^(?:i(?: am|'m) sorry,? (?:but )?)?"
+    r"(?:i(?: am|'m) (?:not able|unable|not going|not comfortable|not willing)"
+    r" to|i (?:can(?:'t|not)|won'?t|will not|do not|don'?t) (?:continue|engage"
+    r"|write|help|assist|participate|produce|generate|proceed|go on|do that"
+    r"|answer|roleplay|create|provide|take part))"
+    r"(?: (?:continue|engage|write|help|assist|participate|produce|generate"
+    r"|proceed|go on|roleplay|create|provide|take part))?\b")
+_REFUSAL_OPENER_HEAD = 40   # characters of a reply the opener must fall within
+
+
 def is_refusal(text: str) -> bool:
-    """Whether `text` is a refusal and nothing else (see REFUSAL_TEXTS)."""
+    """Whether `text` is a refusal and nothing else: one of REFUSAL_TEXTS, or
+    the model declining in its own words, and no longer than REFUSAL_MAX_LEN."""
     t = _norm(text)
-    return len(t) <= REFUSAL_MAX_LEN and any(t.startswith(_norm(r)) for r in REFUSAL_TEXTS)
+    if not t or len(t) > REFUSAL_MAX_LEN:
+        return False
+    if any(t.startswith(_norm(r)) for r in REFUSAL_TEXTS):
+        return True
+    return bool(_REFUSAL_OPENERS.match(t[:_REFUSAL_OPENER_HEAD + 20]))
 
 
 def _could_be_refusal(text: str) -> bool:
@@ -322,7 +348,11 @@ def _could_be_refusal(text: str) -> bool:
     t = _norm(text)
     if len(t) > REFUSAL_MAX_LEN:
         return False
-    return any(_norm(r).startswith(t) or t.startswith(_norm(r)) for r in REFUSAL_TEXTS)
+    if any(_norm(r).startswith(t) or t.startswith(_norm(r)) for r in REFUSAL_TEXTS):
+        return True
+    # Too short to tell how it opens; or it opens like a refusal.
+    return len(t) < _REFUSAL_OPENER_HEAD or bool(
+        _REFUSAL_OPENERS.match(t[:_REFUSAL_OPENER_HEAD + 20]))
 
 
 class _RefusalGuard:
@@ -384,6 +414,10 @@ class _RefusalGuard:
     @property
     def request_message_id(self):
         return getattr(self._stream, "request_message_id", None)
+
+    @property
+    def content_filtered(self):
+        return getattr(self._stream, "content_filtered", False)
 
 
 # A muted account cannot be un-muted from here — the only fix is a fresh one.
@@ -586,8 +620,14 @@ async def chat_completions(req: ChatCompletionRequest, request: Request):
         if echo_lines else ""
 
     # The whole history as one prompt, used when starting a thread — and kept
-    # around as the fallback for when a resumed thread turns out to be gone.
-    fresh_prompt = messages_to_prompt(req.messages)
+    # around as the fallback for when a resumed thread turns out to be gone or
+    # to have refused. Refusals the client kept in the history are left out:
+    # replaying "I'm not going to engage with this content" would only teach
+    # the new branch to say it again.
+    replayable = [m for m in req.messages
+                  if not (m.role == "assistant" and isinstance(m.content, str)
+                          and is_refusal(m.content))]
+    fresh_prompt = messages_to_prompt(replayable)
     if req.tools:
         fresh_prompt = f"{fresh_prompt}\n\n{tools_preamble(req.tools)}"
     # Replaying a whole agentic conversation gives the model a transcript with
@@ -678,7 +718,8 @@ async def chat_completions(req: ChatCompletionRequest, request: Request):
     thinking = req.thinking or model_thinking(req.model)
 
     def remember(reply_text: str, cid: str | None, streamed: bool = False,
-                 calls: list = None, user_mid: int | None = None) -> None:
+                 calls: list = None, user_mid: int | None = None,
+                 filtered: bool = False) -> None:
         """Record the thread so the client's next resend resumes it.
 
         The stored key must describe the assistant turn the way the CLIENT will
@@ -693,8 +734,16 @@ async def chat_completions(req: ChatCompletionRequest, request: Request):
             # went out as a fresh thread: file it as a root, not a child.
             parent = parent_cid if (_session_of(parent_cid) == _session_of(cid)
                                     and ":" in (parent_cid or "")) else None
+            # A refused reply — moderation's canned text or the model's own
+            # words — leaves a state nothing should be continued from.
+            poisoned = filtered or is_refusal(reply_text)
+            if poisoned:
+                debuglog.log_thread(
+                    f"state {cid} is a refusal; the next turn on it will edit "
+                    "the chat's first message instead")
             _threads.remember(history, cid, parent, fingerprint, reply_text,
-                              account=account, user_mid=user_mid)
+                              account=account, user_mid=user_mid,
+                              poisoned=poisoned)
             if tools_fp:
                 # This thread has now seen these tools; later turns need not
                 # repeat the preamble unless the set changes again.
@@ -767,6 +816,23 @@ async def chat_completions(req: ChatCompletionRequest, request: Request):
                         stream = open_stream()
                         first = iter(stream.events())
                         peeked = next(first, None)
+                except PoisonedThread as e:
+                    # The state we would continue from was refused by
+                    # DeepSeek's moderation after the fact; anything sent
+                    # after it is refused too. Edit the chat's first message
+                    # instead: the whole history as a new branch from the root.
+                    root = refusal_retry_target(conversation_id)
+                    debuglog.log_thread(
+                        f"{e}; editing the first message of chat {root}: "
+                        "resending the whole history as a new branch from its root")
+                    conversation_id = parent_cid = root
+                    stream = client.stream(
+                        fresh_prompt, conversation_id=root, model=None,
+                        thinking=thinking, search=req.search,
+                        ref_file_ids=upload_all_images(),
+                    )
+                    peeked = None
+                    first = None
                 except Exception as e:
                     if not _is_stale_thread(e):
                         raise
@@ -808,7 +874,8 @@ async def chat_completions(req: ChatCompletionRequest, request: Request):
                     req.model, stream,
                     on_done=lambda t, c, cs: remember(
                         t, c, streamed=True, calls=cs,
-                        user_mid=getattr(stream, "request_message_id", None)),
+                        user_mid=getattr(stream, "request_message_id", None),
+                        filtered=getattr(stream, "content_filtered", False)),
                     tools_enabled=bool(req.tools),
                     known_names=declared_tool_names(req.tools),
                     leak_labels=leak_labels,
@@ -874,6 +941,15 @@ async def chat_completions(req: ChatCompletionRequest, request: Request):
                     raise
                 debuglog.log_error(f"upstream rejected the token ({e})")
                 reply = await run_in_threadpool(run_chat_relogin)
+        except PoisonedThread as e:
+            root = refusal_retry_target(conversation_id)
+            debuglog.log_thread(
+                f"{e}; editing the first message of chat {root}: resending "
+                "the whole history as a new branch from its root")
+            conversation_id = parent_cid = root
+            reply = await run_in_threadpool(lambda: client.chat(
+                fresh_prompt, root, None, thinking, req.search,
+                upload_all_images()))
         except Exception as e:
             if not _is_stale_thread(e):
                 raise
@@ -958,6 +1034,7 @@ async def chat_completions(req: ChatCompletionRequest, request: Request):
     debuglog.log_turn(tool_calls, text, len(req.tools or []),
                       declared_tool_names(req.tools))
     remember(remembered, reply.conversation_id, calls=tool_calls,
-             user_mid=reply.request_message_id)
+             user_mid=reply.request_message_id,
+             filtered=reply.content_filtered)
     return completion_response(req.model, text, prompt, reply.conversation_id,
                                reasoning=reasoning, tool_calls=tool_calls)

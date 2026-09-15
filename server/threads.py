@@ -199,6 +199,8 @@ class Turn:
     #   it from a different message (records from before this was stored
     #   have "", and are then only recognised by shape)
     user_mid: Optional[int] = None  # DeepSeek's id of the user message
+    poisoned: bool = False     # the reply was a refusal (moderation's canned
+    #   text or the model declining): nothing is continued from this state
 
     @property
     def session(self) -> str:
@@ -237,6 +239,8 @@ class Match:
     kind: str = "append"
     regenerate_of: Optional[int] = None
     similarity: float = 0.0  # edits: how alike the new and old message are
+    recovering: bool = False  # the state found was a refusal, so the turn is
+    #   sent as an edit of the chat's first message instead
 
     @property
     def label(self) -> str:
@@ -245,6 +249,12 @@ class Match:
                 "regenerate": "REGENERATE", "edit": "EDIT"}.get(self.kind, "RESUME")
 
     def describe(self) -> str:
+        if self.recovering:
+            why = ["the state this history continues from was a refusal: "
+                   "editing the chat's first message with the whole history"]
+            if self.depth:
+                why.append(f"{self.depth} turn{'s' if self.depth != 1 else ''} aligned")
+            return ", ".join(why)
         if self.sibling:
             what = ("regenerated" if self.kind == "regenerate" else "edited")
             why = [f"{what} first turn of a known chat"]
@@ -359,10 +369,12 @@ class TurnIndex:
     # ---- writes -------------------------------------------------------------
     def remember(self, history: History, conversation_id: str,
                  parent: Optional[str], reply_fp: str, reply_text: str,
-                 account: str = "", user_mid: Optional[int] = None) -> None:
+                 account: str = "", user_mid: Optional[int] = None,
+                 poisoned: bool = False) -> None:
         """Record that `history` (a whole request) was answered from `parent`
         and left the thread at `conversation_id`, under `account`. `user_mid`
-        is DeepSeek's id of the user message that carried the turn."""
+        is DeepSeek's id of the user message that carried the turn; `poisoned`
+        says the reply was a refusal, so the state must not be continued."""
         if not conversation_id or ":" not in conversation_id or not history:
             return
         role, text, _ = history[-1]
@@ -377,7 +389,7 @@ class TurnIndex:
                  reply_head=reply_head(reply_text), sys_head=system_head(history),
                  prefix=prefix, ts=time.time(), account=account,
                  text=gist(text) if role in _ALIGNABLE else "",
-                 user_mid=user_mid)
+                 user_mid=user_mid, poisoned=poisoned)
         with self._lock:
             # An account is replaced, never revisited (it was muted); its
             # threads are dead and only clutter the index.
@@ -464,7 +476,17 @@ class TurnIndex:
                         best = (rank, m)
                 if best:
                     self._turns.move_to_end(best[1].cid)
-                    return self._classify(best[1], history)
+                    m = best[1]
+                    state = self._turns[m.cid]
+                    if state.poisoned and not m.continues:
+                        # Continuing from a refusal only gets another one.
+                        # Go back to the chat's first message instead: the
+                        # whole history as a new branch from the root.
+                        return Match(cid=state.session, resume_from=0,
+                                     depth=m.depth, sys=m.sys, head=m.head,
+                                     exhaustive=m.exhaustive, sibling=True,
+                                     kind="edit", recovering=True)
+                    return self._classify(m, history)
             m = self._find_sibling(history, positions, sys_h, account)
             if m is None and not self._last_miss:
                 self._last_miss = "no known turn in this history"

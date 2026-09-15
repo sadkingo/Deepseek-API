@@ -129,3 +129,33 @@ class Gist(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class RefusedStates(unittest.TestCase):
+    def test_next_turn_after_a_refusal_edits_the_first_message(self):
+        idx = TurnIndex(path=None)
+        h1 = hist(("user", "sadking: hello there" + NOTE))
+        idx.remember(h1, "sess:2", None, "", "Allison: Hello yourself.", "acct")
+        h2 = hist(("user", "sadking: hello there"), ("assistant", "Allison: Hello yourself."),
+                  ("user", "sadking: come closer" + NOTE))
+        idx.remember(h2, "sess:4", "sess:2", "", "I'm not going to engage with this content.",
+                     "acct", poisoned=True)
+        h3 = h2[:-1] + [("user", "sadking: come closer", ""),
+                        ("assistant", "I'm not going to engage with this content.", ""),
+                        ("user", "sadking: *I sit beside her*" + NOTE, "")]
+        m = idx.find(h3, "acct")
+        self.assertIsNotNone(m)
+        self.assertTrue(m.recovering)
+        self.assertEqual((m.cid, m.resume_from, m.sibling, m.kind), ("sess", 0, True, "edit"))
+        self.assertIn("refusal", m.describe())
+
+    def test_a_swipe_on_a_refusal_regenerates_from_the_good_state(self):
+        idx = TurnIndex(path=None)
+        h1 = hist(("user", "sadking: hello there" + NOTE))
+        idx.remember(h1, "sess:2", None, "", "Allison: Hello yourself.", "acct")
+        h2 = hist(("user", "sadking: hello there"), ("assistant", "Allison: Hello yourself."),
+                  ("user", "sadking: come closer" + NOTE))
+        idx.remember(h2, "sess:4", "sess:2", "", "I'm not going to engage.", "acct", poisoned=True)
+        m = idx.find(h2, "acct")
+        self.assertFalse(m.recovering)
+        self.assertEqual((m.cid, m.kind, m.regenerate_of), ("sess:2", "regenerate", 4))

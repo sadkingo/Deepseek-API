@@ -194,6 +194,7 @@ class Reply:
     conversation_id: str
     thinking: Optional[str] = None
     request_message_id: Optional[int] = None  # DeepSeek's id of the user turn
+    content_filtered: bool = False  # moderation replaced the reply afterwards
 
     def __str__(self) -> str:  # so print(reply) shows the text
         return self.text
@@ -354,16 +355,32 @@ class DeepSeekClient:
         except Exception as e:
             _log.debug("could not sync cookies: %s", e)
 
-    def _simulate_thread_navigation(self, chat_session_id: str) -> None:
-        """Emulate web UI loading conversation history prior to submitting a turn."""
+    def _simulate_thread_navigation(self, chat_session_id: str) -> Optional[list]:
+        """Emulate web UI loading conversation history prior to submitting a
+        turn. Returns the chat's messages when the fetch worked, so the caller
+        can check the state it is about to continue from."""
         try:
-            self._http.get(
+            r = self._http.get(
                 "/api/v0/chat/history_messages",
                 params={"chat_session_id": chat_session_id},
                 timeout=10,
             )
+            return _biz(r.json()).get("chat_messages") or []
         except Exception as e:
             _log.debug("thread navigation simulation skipped: %s", e)
+            return None
+
+    @staticmethod
+    def _refused_by_moderation(messages: Optional[list], message_id: Optional[int]) -> bool:
+        """Whether `message_id` in a history listing was content-filtered."""
+        if not messages or message_id is None:
+            return False
+        for m in messages:
+            if m.get("message_id") == message_id:
+                return (m.get("status") == _FILTERED_STATUS
+                        or any(f.get("type") == "TEMPLATE_RESPONSE"
+                               for f in m.get("fragments") or []))
+        return False
 
     def _base_headers(self) -> dict:
         # No content-type here: httpx derives it per request (application/json
@@ -522,7 +539,8 @@ class DeepSeekClient:
         return Reply(text="".join(parts["text"]),
                      conversation_id=s.conversation_id,
                      thinking="".join(parts["thinking"]) or None,
-                     request_message_id=s.request_message_id)
+                     request_message_id=s.request_message_id,
+                     content_filtered=s.content_filtered)
 
     def _touch(self, delta: int = 0) -> None:
         """Record upstream progress (and optionally adjust the in-flight count)."""
@@ -590,6 +608,7 @@ class _Stream:
         self._own_session = session_id is None
         self._message_id: Optional[int] = None
         self._request_message_id: Optional[int] = None
+        self._content_filtered = False
 
     def __iter__(self) -> Iterator[str]:
         return (chunk for kind, chunk in self.events() if kind == "text")
@@ -646,7 +665,15 @@ class _Stream:
             self._session_id = self._client.create_chat_session()
         else:
             # Resuming thread: simulate authentic browser UI loading history prior to sending turn
-            self._client._simulate_thread_navigation(self._session_id)
+            history = self._client._simulate_thread_navigation(self._session_id)
+            # The moderation verdict on a reply can arrive after its text has
+            # streamed, so the listing is the authority: never continue from
+            # a reply DeepSeek has since replaced with its refusal.
+            if self._parent_id is not None and self._client._refused_by_moderation(
+                    history, self._parent_id):
+                raise PoisonedThread(
+                    f"message {self._parent_id} of chat {self._session_id} was "
+                    "refused by DeepSeek's moderation (CONTENT_FILTER)")
         body = {
             "chat_session_id": self._session_id,
             "parent_message_id": self._parent_id,
@@ -749,6 +776,7 @@ class _Stream:
         if meta.get("message_id") is not None:
             self._message_id = meta["message_id"]
             self._request_message_id = meta.get("request_message_id")
+            self._content_filtered = bool(meta.get("content_filter"))
             return
         # HTTP 200 but nothing usable came back. Only an over-long prompt is
         # worth naming as a cause, and only for "expert", which goes silent
@@ -781,6 +809,12 @@ class _Stream:
         """DeepSeek's id of the user message this reply answered, once known."""
         return self._request_message_id
 
+    @property
+    def content_filtered(self) -> bool:
+        """Whether DeepSeek's moderation replaced this reply with its canned
+        refusal (status CONTENT_FILTER). The text may still have streamed."""
+        return self._content_filtered
+
 
 # Fragment types, mapped to the event kind callers see.
 #
@@ -797,8 +831,16 @@ class _Stream:
 # the web UI's own notice bar, not the model speaking. It carries lines like
 # "This response is AI-generated, for reference only." (style WARNING), which
 # DeepSeek shows beside the answer and would otherwise be appended to it.
+# "TEMPLATE_RESPONSE" is the canned text the web app shows in place of a reply
+# DeepSeek's moderation removed after the fact ("Sorry, that's beyond my
+# current scope..."); the message's status becomes CONTENT_FILTER. It is not
+# the model speaking either, and it marks the thread state as one that
+# refuses whatever follows (see `meta["content_filter"]`).
 _FRAGMENT_KINDS = {"THINK": "thinking", "RESPONSE": "text", "READ_LINK": "text"}
-_SKIPPED_FRAGMENTS = {"TIP"}
+_SKIPPED_FRAGMENTS = {"TIP", "TEMPLATE_RESPONSE"}
+_FILTERED_STATUS = "CONTENT_FILTER"
+# Frames worth a log line when they appear (everything but the routine ones).
+_ROUTINE_EVENTS = {"ready", "update_session", "title", "close", "finish"}
 _DEFAULT_FRAGMENT_KIND = "text"
 
 
@@ -822,6 +864,14 @@ def _fragment_kind(frag_type) -> Optional[str]:
     return _FRAGMENT_KINDS.get(frag_type, _DEFAULT_FRAGMENT_KIND)
 
 
+class PoisonedThread(RuntimeError):
+    """The thread state a turn would continue from is a reply DeepSeek's
+    moderation removed (status CONTENT_FILTER, shown as "Sorry, that's beyond
+    my current scope..."). Everything sent after such a state is refused as
+    well, so the caller should branch from the chat's root instead. Raised
+    before anything is sent."""
+
+
 class UpstreamGaveUp(RuntimeError):
     """DeepSeek accepted the request and then abandoned it.
 
@@ -841,13 +891,29 @@ def _parse_sse(lines, meta: Optional[dict] = None) -> Iterator[tuple]:
     frame shape is a log line instead of an investigation.
     """
     raw: list = []
+    notable: list = []
 
     def tap():
+        pending_event = None
         for line in lines:
             text = line.decode("utf-8", errors="replace") \
                 if isinstance(line, bytes) else line
             if text and text.strip() != ":" and len(raw) < 20:
                 raw.append(text[:300])
+            # Anything that is not a content delta or a routine event is
+            # worth seeing: status changes, hints, fragment replacements.
+            if text.startswith("event:"):
+                pending_event = text[6:].strip()
+                if pending_event not in _ROUTINE_EVENTS and len(notable) < 12:
+                    notable.append(text[:200])
+            elif text.startswith("data:"):
+                if pending_event and pending_event not in _ROUTINE_EVENTS \
+                        and len(notable) < 12:
+                    notable.append(text[:200])
+                elif '"p"' in text and "content" not in text \
+                        and "fragments" not in text and len(notable) < 12:
+                    notable.append(text[:200])
+                pending_event = None
             yield text
 
     produced = False
@@ -857,6 +923,12 @@ def _parse_sse(lines, meta: Optional[dict] = None) -> Iterator[tuple]:
     if not produced:
         _log.warning("upstream stream closed without content; frames seen: %s",
                      raw or "(none)")
+    elif notable:
+        _log.info("upstream stream: notable frames: %s", notable)
+    if meta is not None and meta.get("content_filter"):
+        _log.warning("upstream marked this reply CONTENT_FILTER: DeepSeek shows "
+                     "its canned refusal in place of the text and the thread "
+                     "state is poisoned")
 
 
 def _parse_sse_frames(lines, meta: Optional[dict] = None) -> Iterator[tuple]:
@@ -938,8 +1010,12 @@ def _parse_sse_frames(lines, meta: Optional[dict] = None) -> Iterator[tuple]:
         if isinstance(v, dict) and "response" in v:
             if meta is not None:
                 _capture_message_id(meta, v)
+                if v["response"].get("status") == _FILTERED_STATUS:
+                    meta["content_filter"] = True
             fragments = v["response"].get("fragments", [])
             for frag in fragments:
+                if meta is not None and frag.get("type") == "TEMPLATE_RESPONSE":
+                    meta["content_filter"] = True
                 frag_kind = _fragment_kind(frag.get("type"))
                 if frag_kind and frag.get("content") and not snapshot_seen:
                     yield (frag_kind, frag["content"])
@@ -955,12 +1031,17 @@ def _parse_sse_frames(lines, meta: Optional[dict] = None) -> Iterator[tuple]:
             if meta is not None and active_path.endswith("message_id") \
                     and isinstance(v, int):
                 meta["message_id"] = v
+            if meta is not None and active_path.endswith("status") \
+                    and v == _FILTERED_STATUS:
+                meta["content_filter"] = True
             # New fragment(s) appended: emit their initial content and retarget
             # subsequent content appends at the (new) last fragment's type.
             if active_path.endswith("fragments") and isinstance(v, list):
                 for frag in v:
                     if not isinstance(frag, dict):
                         continue
+                    if meta is not None and frag.get("type") == "TEMPLATE_RESPONSE":
+                        meta["content_filter"] = True
                     kind = _fragment_kind(frag.get("type"))
                     if kind and frag.get("content"):
                         yield (kind, frag["content"])

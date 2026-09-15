@@ -27,6 +27,20 @@ class IsRefusal(unittest.TestCase):
         self.assertFalse(is_refusal(REFUSAL + " " + "But here is what I can say. " * 15))
         self.assertFalse(is_refusal(""))
 
+    def test_model_refusals_in_its_own_words(self):
+        for s in ("I'm not going to engage with this content. If you're looking for creative "
+                  "writing help, I'm happy to assist with other projects.",
+                  "I'm not able to continue with this type of roleplay content. If you'd like "
+                  "to start a different scene or story, I'm happy to help with that.",
+                  "I am sorry, but I cannot answer that question.",
+                  "I can't continue this roleplay."):
+            self.assertTrue(is_refusal(s), s)
+        for s in ("*I'm not able to hide my smile as I turn around.* You're late, again. " + "x" * 40,
+                  "I'm not sure that's true. Anyway, the sink is broken and " + "y" * 30,
+                  "I won't let you leave. *She grabs your arm.*",
+                  "I can't believe you did that. *She laughs.*"):
+            self.assertFalse(is_refusal(s), s)
+
     def test_the_other_refusals(self):
         self.assertTrue(is_refusal("I am sorry, I cannot answer that question. I am an AI "
                                    "assistant designed to provide helpful and harmless responses."))

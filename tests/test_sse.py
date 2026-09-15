@@ -64,3 +64,39 @@ class ParseSseTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class ContentFilterTests(unittest.TestCase):
+    def test_status_frame_marks_the_reply_filtered(self):
+        lines = _stream(
+            'data: {"request_message_id":1,"response_message_id":2}',
+            'data: {"v":{"response":{"message_id":2,"status":"WIP","fragments":[{"type":"RESPONSE","content":"Once"}]}}}',
+            'data: {"v":" upon"}',
+            'data: {"p":"response/status","v":"CONTENT_FILTER"}',
+        )
+        meta = {}
+        out = list(_parse_sse(lines, meta))
+        self.assertEqual(out, [("text", "Once"), ("text", " upon")])
+        self.assertTrue(meta["content_filter"])
+
+    def test_template_fragment_is_not_reply_text_and_marks_filtered(self):
+        lines = _stream(
+            'data: {"request_message_id":1,"response_message_id":2}',
+            'data: {"v":{"response":{"message_id":2,"status":"CONTENT_FILTER","fragments":[{"type":"TEMPLATE_RESPONSE","content":"Sorry, that\'s beyond my current scope."}]}}}',
+        )
+        meta = {}
+        with self.assertLogs("deepseek.upstream", level="WARNING"):
+            out = list(_parse_sse(lines, meta))
+        self.assertEqual(out, [])
+        self.assertTrue(meta["content_filter"])
+
+    def test_refused_by_moderation_reads_the_history_listing(self):
+        from deepseek.client import DeepSeekClient
+        msgs = [{"message_id": 6, "status": "CONTENT_FILTER",
+                 "fragments": [{"type": "TEMPLATE_RESPONSE", "content": "Sorry..."}]},
+                {"message_id": 8, "status": "FINISHED",
+                 "fragments": [{"type": "RESPONSE", "content": "fine"}]}]
+        self.assertTrue(DeepSeekClient._refused_by_moderation(msgs, 6))
+        self.assertFalse(DeepSeekClient._refused_by_moderation(msgs, 8))
+        self.assertFalse(DeepSeekClient._refused_by_moderation(msgs, 99))
+        self.assertFalse(DeepSeekClient._refused_by_moderation(None, 6))
