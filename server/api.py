@@ -278,6 +278,10 @@ class _Replayed:
     def conversation_id(self):
         return self._stream.conversation_id
 
+    @property
+    def request_message_id(self):
+        return getattr(self._stream, "request_message_id", None)
+
 
 # A muted account cannot be un-muted from here — the only fix is a fresh one.
 # When an upstream error says "user is muted", the server drops a flag file
@@ -458,7 +462,11 @@ async def chat_completions(req: ChatCompletionRequest, request: Request):
                 f"resending {len(history) - resume_from} of {len(history)} messages")
         else:
             debuglog.log_thread(
-                f"no thread matches this history of {len(history)} messages")
+                f"no thread matches this history of {len(history)} messages"
+                f" ({_threads.last_miss() or 'nothing recognised'})")
+    # DeepSeek's own Regenerate: the same question this state already
+    # answered gets another response instead of a second copy of itself.
+    regenerate_of = match.regenerate_of if match else None
     # What this turn is sent from, so its result can be filed under it.
     parent_cid = conversation_id
 
@@ -548,7 +556,14 @@ async def chat_completions(req: ChatCompletionRequest, request: Request):
             status=400, err_type="invalid_request_error",
         )
 
-    debuglog.log_prompt(prompt, conversation_id, resumed=bool(conversation_id))
+    if match:
+        mode = f"{match.label} {'first turn of chat' if match.sibling else 'thread'}"
+    elif conversation_id:
+        mode = "RESUME thread"
+    else:
+        mode = "NEW chat"
+    debuglog.log_prompt(prompt, conversation_id, resumed=bool(conversation_id),
+                        mode=mode)
 
     # A thread's model is fixed when it's created, so on resume we ignore `model`
     # (the OpenAI SDK always sends one) and let the existing thread's model stand.
@@ -560,7 +575,7 @@ async def chat_completions(req: ChatCompletionRequest, request: Request):
     thinking = req.thinking or model_thinking(req.model)
 
     def remember(reply_text: str, cid: str | None, streamed: bool = False,
-                 calls: list = None) -> None:
+                 calls: list = None, user_mid: int | None = None) -> None:
         """Record the thread so the client's next resend resumes it.
 
         The stored key must describe the assistant turn the way the CLIENT will
@@ -576,7 +591,7 @@ async def chat_completions(req: ChatCompletionRequest, request: Request):
             parent = parent_cid if (_session_of(parent_cid) == _session_of(cid)
                                     and ":" in (parent_cid or "")) else None
             _threads.remember(history, cid, parent, fingerprint, reply_text,
-                              account=account)
+                              account=account, user_mid=user_mid)
             if tools_fp:
                 # This thread has now seen these tools; later turns need not
                 # repeat the preamble unless the set changes again.
@@ -603,6 +618,7 @@ async def chat_completions(req: ChatCompletionRequest, request: Request):
         return bool(conversation_id) and (
             "invalid message id" in text
             or "invalid session" in text
+            or "invalid chat session" in text
             or "session not found" in text
             or "chat session" in text and "not" in text
         )
@@ -617,7 +633,7 @@ async def chat_completions(req: ChatCompletionRequest, request: Request):
                     return client.stream(
                         prompt, conversation_id=conversation_id,
                         model=model_type, thinking=thinking, search=req.search,
-                        ref_file_ids=files,
+                        ref_file_ids=files, regenerate_of=regenerate_of,
                     )
 
                 try:
@@ -655,8 +671,9 @@ async def chat_completions(req: ChatCompletionRequest, request: Request):
                 include_usage = bool(req.stream_options and req.stream_options.get("include_usage"))
                 yield from stream_chunks(
                     req.model, stream,
-                    on_done=lambda t, c, cs: remember(t, c, streamed=True,
-                                                     calls=cs),
+                    on_done=lambda t, c, cs: remember(
+                        t, c, streamed=True, calls=cs,
+                        user_mid=getattr(stream, "request_message_id", None)),
                     tools_enabled=bool(req.tools),
                     known_names=declared_tool_names(req.tools),
                     leak_labels=leak_labels,
@@ -698,7 +715,8 @@ async def chat_completions(req: ChatCompletionRequest, request: Request):
 
     def run_chat():
         return client.chat(prompt, conversation_id, model_type,
-                           thinking, req.search, upload_images())
+                           thinking, req.search, upload_images(),
+                           regenerate_of=regenerate_of)
 
     def run_chat_fresh():
         """Same turn, but as a brand-new thread from the full history."""
@@ -785,6 +803,7 @@ async def chat_completions(req: ChatCompletionRequest, request: Request):
         remembered = text
     debuglog.log_turn(tool_calls, text, len(req.tools or []),
                       declared_tool_names(req.tools))
-    remember(remembered, reply.conversation_id, calls=tool_calls)
+    remember(remembered, reply.conversation_id, calls=tool_calls,
+             user_mid=reply.request_message_id)
     return completion_response(req.model, text, prompt, reply.conversation_id,
                                reasoning=reasoning, tool_calls=tool_calls)

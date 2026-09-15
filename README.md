@@ -500,24 +500,37 @@ This is deliberately loose about everything frontends rewrite between turns:
   resend it *without* that paragraph as history.
 - **Dropped history is fine.** Once the context window fills, clients trim the
   oldest messages; alignment does not need the start of the conversation.
-- **Regenerations and swipes branch.** Regenerating resumes from the state
-  *before* the turn, so DeepSeek forks the thread instead of seeing the
-  conversation twice, and whichever swipe the client keeps is recognised by
-  its opening on the next turn.
+- **Regenerations and swipes regenerate.** The same message again, sent from
+  a state that already answered it, is answered with DeepSeek's own
+  Regenerate on that answer: the chat gains a second *response* to the same
+  question, exactly as the Regenerate button does, rather than a second copy
+  of the question. Whichever swipe the client keeps is recognised by its
+  opening on the next turn. If DeepSeek refuses the regeneration (it has a
+  per-message quota) the turn goes out as a new branch instead.
 - **Edits resume from before the edit.** A changed message anywhere in the
   history rejects every thread state that was built on the old wording; the
   lookup falls back to the last state that agrees and resends from there.
 - **"Continue" continues.** When the client resends our own last reply with
   nothing after it, the thread is resumed with an instruction to carry on,
   rather than being handed its own words as a new message.
-- **Regenerating or editing a thread's first turn stays in that chat.** The
-  first turn of a thread has no earlier state to resume — the thread began
-  with it — so the whole prompt has to go again. It goes into the *same*
-  DeepSeek chat as a new branch from the root (a bare session id), not into
-  yet another chat, provided the history before it agrees with what that
-  thread remembers. This is the common case right after a restart with an
-  empty index or a freshly registered account: the first turn opens the chat,
-  and every swipe or edit of it stays there.
+- **A thread's first turn: regenerate, edit, or a new chat.** The first turn
+  of a thread has no earlier state to resume — the thread began with it — so
+  when it comes back the message itself decides. The *same* message is a
+  swipe: DeepSeek regenerates that chat's first reply. A *rewrite* of it
+  (the words are mostly the same) is an edit: the whole prompt goes again as
+  a new branch of the same chat (a bare session id resumes a chat at its
+  root). A *different* message is a new conversation and opens a new chat,
+  even though it starts from the same system prompt and greeting — roleplay
+  frontends open every chat from the same card, so that prefix says nothing
+  about which chat this is, and branching every new conversation into the
+  first one made the DeepSeek side look like one chat being edited forever.
+  "Mostly the same" is a word-level similarity of 55%, or 40% within 15
+  minutes of the chat opening, when edits actually happen
+  (`THREAD_EDIT_SIMILARITY`, `THREAD_RECENT_EDIT_SIMILARITY`,
+  `THREAD_RECENT_EDIT_WINDOW`).
+- **Edits deeper in a chat branch from before the edit.** A changed version of
+  a question the thread already answered is sent from the state before it, so
+  DeepSeek shows it as an edited message with the old version kept.
 - **A replaced account's threads are never tried.** Every recorded turn is
   tagged with the signed-in account; after a muted account is swapped for a
   fresh one, the dead threads are skipped and pruned instead of each costing

@@ -122,13 +122,16 @@ def log_request(method: str, path: str, body: bytes, headers) -> None:
                     i, m.get("role"), shape, preview)
 
 
-def log_prompt(prompt: str, conversation_id: Optional[str], resumed: bool) -> None:
-    """Log what will actually be sent upstream to DeepSeek."""
+def log_prompt(prompt: str, conversation_id: Optional[str], resumed: bool,
+               mode: Optional[str] = None) -> None:
+    """Log what will actually be sent upstream to DeepSeek. `mode` names the
+    operation (NEW chat, RESUME thread, REGENERATE thread, EDIT first turn of
+    chat, ...); without it the id alone decides between new and resumed."""
     if not ENABLED:
         return
     logger().info(
         "    => %s  cid=%s  prompt(%d): %s",
-        "RESUME thread" if resumed else "NEW thread",
+        mode or ("RESUME thread" if resumed else "NEW chat"),
         conversation_id or "-", len(prompt), _clip(prompt, 600),
     )
 

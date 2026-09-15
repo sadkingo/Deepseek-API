@@ -50,6 +50,9 @@ _log = logging.getLogger("deepseek.upstream")
 
 BASE = "https://chat.deepseek.com"
 COMPLETION_PATH = "/api/v0/chat/completion"
+# Re-answers an existing assistant message as a new sibling response. Its PoW
+# header still targets the completion path, exactly as the web app does.
+REGENERATE_PATH = "/api/v0/chat/regenerate"
 UPLOAD_PATH = "/api/v0/file/upload_file"
 FETCH_FILES_PATH = "/api/v0/file/fetch_files"
 
@@ -190,6 +193,7 @@ class Reply:
     text: str
     conversation_id: str
     thinking: Optional[str] = None
+    request_message_id: Optional[int] = None  # DeepSeek's id of the user turn
 
     def __str__(self) -> str:  # so print(reply) shows the text
         return self.text
@@ -459,10 +463,18 @@ class DeepSeekClient:
         thinking: bool = False,
         search: bool = False,
         ref_file_ids: Optional[list] = None,
+        regenerate_of: Optional[int] = None,
     ) -> "_Stream":
         """Stream a reply. Iterate it for text chunks; read `.conversation_id`
         afterwards to resume the thread. Pass an existing `conversation_id` to
         continue a previous conversation.
+
+        `regenerate_of` is the id of an assistant message in that conversation
+        to answer again: DeepSeek then produces a sibling response to the same
+        user turn (its own Regenerate button) instead of a new user message. It
+        requires `conversation_id`. `prompt` is still needed — should DeepSeek
+        refuse the regeneration (it has a per-message quota), the turn is sent
+        as an ordinary completion from `conversation_id` instead.
 
         `model` is DeepSeek's model_type wire value: "default" (Instant) or
         "expert"; it defaults to "default" on a NEW thread. It cannot be combined
@@ -485,8 +497,10 @@ class DeepSeekClient:
         else:
             # Resuming: let the existing thread's model stand (send no model_type).
             model_type = None
+        if regenerate_of is not None and session_id is None:
+            raise ValueError("`regenerate_of` needs a `conversation_id`")
         return _Stream(self, prompt, session_id, parent_id, model_type,
-                       thinking, search, ref_file_ids)
+                       thinking, search, ref_file_ids, regenerate_of)
 
     def chat(
         self,
@@ -496,16 +510,19 @@ class DeepSeekClient:
         thinking: bool = False,
         search: bool = False,
         ref_file_ids: Optional[list] = None,
+        regenerate_of: Optional[int] = None,
     ) -> Reply:
         """Return the complete reply (`.text`) plus its `.conversation_id`."""
         s = self.stream(prompt, conversation_id=conversation_id, model=model,
-                        thinking=thinking, search=search, ref_file_ids=ref_file_ids)
+                        thinking=thinking, search=search, ref_file_ids=ref_file_ids,
+                        regenerate_of=regenerate_of)
         parts = {"thinking": [], "text": []}
         for kind, chunk in s.events():
             parts[kind].append(chunk)
         return Reply(text="".join(parts["text"]),
                      conversation_id=s.conversation_id,
-                     thinking="".join(parts["thinking"]) or None)
+                     thinking="".join(parts["thinking"]) or None,
+                     request_message_id=s.request_message_id)
 
     def _touch(self, delta: int = 0) -> None:
         """Record upstream progress (and optionally adjust the in-flight count)."""
@@ -557,7 +574,8 @@ class _Stream:
     def __init__(self, client: "DeepSeekClient", prompt: str,
                  session_id: Optional[str], parent_id: Optional[int],
                  model: Optional[str], thinking: bool, search: bool,
-                 ref_file_ids: Optional[list] = None):
+                 ref_file_ids: Optional[list] = None,
+                 regenerate_of: Optional[int] = None):
         self._client = client
         self._prompt = prompt
         self._session_id = session_id
@@ -566,7 +584,12 @@ class _Stream:
         self._thinking = thinking
         self._search = search
         self._ref_file_ids = list(ref_file_ids or [])
+        self._regenerate_of = regenerate_of
+        # Whether this stream opens the chat itself (as opposed to branching
+        # from the root of an existing one, which also has no parent).
+        self._own_session = session_id is None
         self._message_id: Optional[int] = None
+        self._request_message_id: Optional[int] = None
 
     def __iter__(self) -> Iterator[str]:
         return (chunk for kind, chunk in self.events() if kind == "text")
@@ -591,7 +614,34 @@ class _Stream:
             self._client.sync_cookies()
 
     def _attempt(self, meta: dict) -> Iterator[tuple]:
-        """One completion request; yields its events and fills `meta`."""
+        """One upstream request; yields its events and fills `meta`.
+
+        A regeneration that DeepSeek refuses outright (its per-message quota,
+        a message it will not regenerate) falls back to an ordinary completion
+        from the same state, so the turn is answered either way — as a new
+        branch rather than a new response version.
+        """
+        if self._regenerate_of is not None:
+            produced = False
+            try:
+                for event in self._request(REGENERATE_PATH, {
+                    "chat_session_id": self._session_id,
+                    "child_message_id": self._regenerate_of,
+                    "search_enabled": self._search,
+                    "thinking_enabled": self._thinking,
+                    "user_options": None,
+                }, meta):
+                    produced = True
+                    yield event
+                return
+            except RuntimeError as e:
+                if produced or "rejected the request" not in str(e):
+                    raise
+                _log.warning("regenerate of message %s refused (%s); sending "
+                             "the turn as a new branch instead",
+                             self._regenerate_of, e)
+                self._regenerate_of = None
+                meta.clear()
         if self._session_id is None:
             self._session_id = self._client.create_chat_session()
         else:
@@ -610,11 +660,17 @@ class _Stream:
         # Only select a model on a new thread; on resume the thread keeps its own.
         if self._model is not None:
             body["model_type"] = self._model
+        yield from self._request(COMPLETION_PATH, body, meta)
+
+    def _request(self, path: str, body: dict, meta: dict) -> Iterator[tuple]:
+        """POST `body` to `path` and yield the parsed SSE events."""
         # PoW challenges are short-lived, so solve right before the request.
+        # Every completion-like call is signed for the completion path, as the
+        # web app does ("completion_like" scene).
         headers = {"x-ds-pow-response": self._client._pow_header()}
         if getattr(self._client, "_use_curl", False):
             resp = self._client._http.post(
-                COMPLETION_PATH,
+                path,
                 json=body,
                 headers=headers,
                 stream=True,
@@ -624,7 +680,7 @@ class _Stream:
             yield from _parse_sse(resp.iter_lines(), meta)
         else:
             with self._client._http.stream(
-                "POST", COMPLETION_PATH, json=body, headers=headers
+                "POST", path, json=body, headers=headers
             ) as resp:
                 resp.raise_for_status()
                 yield from _parse_sse(resp.iter_lines(), meta)
@@ -677,8 +733,9 @@ class _Stream:
             pacer.wait()
             # A fresh session: the first attempt already consumed a message slot
             # in this thread, and nothing was emitted from it, so starting clean
-            # keeps the thread history free of a stray empty turn.
-            if self._parent_id is None:
+            # keeps the thread history free of a stray empty turn. A branch or
+            # regeneration inside an existing chat stays in that chat.
+            if self._own_session and self._regenerate_of is None:
                 self._session_id = None
             meta = {}
             started, seen = time.time(), {}
@@ -691,6 +748,7 @@ class _Stream:
 
         if meta.get("message_id") is not None:
             self._message_id = meta["message_id"]
+            self._request_message_id = meta.get("request_message_id")
             return
         # HTTP 200 but nothing usable came back. Only an over-long prompt is
         # worth naming as a cause, and only for "expert", which goes silent
@@ -717,6 +775,11 @@ class _Stream:
     @property
     def conversation_id(self) -> str:
         return _encode_cid(self._session_id, self._message_id)
+
+    @property
+    def request_message_id(self) -> Optional[int]:
+        """DeepSeek's id of the user message this reply answered, once known."""
+        return self._request_message_id
 
 
 # Fragment types, mapped to the event kind callers see.
@@ -861,9 +924,13 @@ def _parse_sse_frames(lines, meta: Optional[dict] = None) -> Iterator[tuple]:
             continue
         event_name = None
 
-        # The `ready` frame names the assistant message before any content.
+        # The `ready` frame names the assistant message before any content —
+        # and the user message it answers, which a later edit or regeneration
+        # of this turn addresses.
         if meta is not None and isinstance(obj.get("response_message_id"), int):
             meta["message_id"] = obj["response_message_id"]
+            if isinstance(obj.get("request_message_id"), int):
+                meta["request_message_id"] = obj["request_message_id"]
 
         v = obj.get("v")
 

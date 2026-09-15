@@ -31,15 +31,26 @@ then walk its ancestors and the history backwards together, checking that
 they agree, and score the alignment by how much evidence supports it. The
 best-supported thread state wins and the messages after it are resent.
 
+Once a state is found, the turn is classified by what the client is doing to
+it (`Match.kind`): continuing the chat, asking the same question again (a
+regeneration, answered with DeepSeek's own Regenerate so the chat shows a
+second response rather than a second question), or editing a question (a new
+branch). When nothing can be resumed and the message is the FIRST turn of a
+known chat, the message text decides between an edit of that chat's opening
+(similar text: same chat, new branch) and a new conversation that merely
+starts from the same greeting (a new chat).
+
 The index is saved to disk (`session/threads.json`) so a server restart does
 not turn every open conversation into a fresh thread.
 """
 
 from __future__ import annotations
 
+import difflib
 import hashlib
 import json
 import os
+import re
 import threading
 import time
 from collections import OrderedDict
@@ -62,6 +73,15 @@ _LINE_CAP = 64      # lines hashed per message
 _PREFIX_CAP = 8     # earlier messages a root record remembers, for verifying
 _SYS_HEAD = 300     # characters of the system prompt that identify it
 _REPLY_HEAD = 160   # characters of our reply used to tell branches apart
+_TEXT_CAP = 2000    # characters of a turn's message kept for similarity
+
+# A first turn that differs from a chat's recorded opening is an EDIT of that
+# opening when the texts are this similar (difflib ratio), else a NEW chat
+# that happens to start from the same greeting. Edits are made right after
+# reading the reply, so a recently opened chat accepts a looser rewrite.
+EDIT_SIMILARITY = float(os.getenv("THREAD_EDIT_SIMILARITY", "0.55"))
+RECENT_EDIT_SIMILARITY = float(os.getenv("THREAD_RECENT_EDIT_SIMILARITY", "0.4"))
+RECENT_EDIT_WINDOW = float(os.getenv("THREAD_RECENT_EDIT_WINDOW", str(15 * 60)))
 
 
 def _h(s: str) -> str:
@@ -101,6 +121,50 @@ def reply_head(text: str) -> str:
     return _h(" ".join(text.split())[:_REPLY_HEAD])
 
 
+def gist(text: str) -> str:
+    """A message reduced to what the user wrote: the note lines a frontend
+    appended are dropped (they are identical on every turn and would make any
+    two short messages look alike), whitespace is normalised, and the result
+    is capped."""
+    from server.openai_format import split_trailing_notes  # no import cycle
+    body, _ = split_trailing_notes(text)
+    return " ".join(body.split())[:_TEXT_CAP]
+
+
+_TOKEN_CAP = 400
+
+
+def _tokens(text: str) -> List[str]:
+    """Lower-cased words, punctuation dropped. Similarity is measured on
+    these rather than on characters: two English sentences share most of
+    their letters whatever they say, while an edit keeps most of its words."""
+    return re.findall(r"\w+", text.lower())[:_TOKEN_CAP]
+
+
+def similarity(a: str, b: str) -> float:
+    """How alike two message gists are, 0..1 (difflib ratio over words)."""
+    if not a or not b:
+        return 0.0
+    if a == b:
+        return 1.0
+    ta, tb = _tokens(a), _tokens(b)
+    if not ta or not tb:
+        return 0.0
+    m = difflib.SequenceMatcher(None, ta, tb, autojunk=False)
+    # The cheap upper bound rules most pairs out without the full alignment.
+    if m.quick_ratio() < min(EDIT_SIMILARITY, RECENT_EDIT_SIMILARITY):
+        return m.quick_ratio()
+    return m.ratio()
+
+
+def edit_threshold(opened_at: float, now: Optional[float] = None) -> float:
+    """Similarity a rewritten first turn needs to count as an edit of a chat
+    opened at `opened_at`."""
+    now = time.time() if now is None else now
+    recent = 0 <= now - opened_at < RECENT_EDIT_WINDOW
+    return RECENT_EDIT_SIMILARITY if recent else EDIT_SIMILARITY
+
+
 def compatible(a: List[str], b: List[str]) -> bool:
     """Whether two shapes are the same message, one possibly decorated.
 
@@ -131,10 +195,20 @@ class Turn:
     account: str = ""          # which DeepSeek account owns the session: a
     #   thread from a previous (muted, replaced) account is dead and never
     #   worth a request
+    text: str = ""             # gist of the message, for telling an edit of
+    #   it from a different message (records from before this was stored
+    #   have "", and are then only recognised by shape)
+    user_mid: Optional[int] = None  # DeepSeek's id of the user message
 
     @property
     def session(self) -> str:
         return self.cid.partition(":")[0]
+
+    @property
+    def message_id(self) -> Optional[int]:
+        """DeepSeek's id of the assistant message this turn produced."""
+        _, _, mid = self.cid.partition(":")
+        return int(mid) if mid.isdigit() else None
 
 
 @dataclass
@@ -152,14 +226,38 @@ class Match:
     #   regeneration or edit of a thread's FIRST turn, whose earlier state we
     #   never had, so it is re-sent in full as a new branch of the same chat
     #   rather than as yet another chat
+    # What the client is doing to the matched state:
+    #   "append"      a new message after it (the ordinary next turn)
+    #   "continue"    carry on the reply it produced
+    #   "regenerate"  the same message this state already answered: answer it
+    #                 again as another response (`regenerate_of` is that
+    #                 answer's message id)
+    #   "edit"        a changed version of a message it already answered: a
+    #                 new branch from this state
+    kind: str = "append"
+    regenerate_of: Optional[int] = None
+    similarity: float = 0.0  # edits: how alike the new and old message are
+
+    @property
+    def label(self) -> str:
+        """Short upper-case verb for the log line."""
+        return {"append": "RESUME", "continue": "CONTINUE",
+                "regenerate": "REGENERATE", "edit": "EDIT"}.get(self.kind, "RESUME")
 
     def describe(self) -> str:
         if self.sibling:
-            why = ["regenerated or edited first turn: new branch of the same chat"]
+            what = ("regenerated" if self.kind == "regenerate" else "edited")
+            why = [f"{what} first turn of a known chat"]
+            if self.kind == "edit":
+                why.append(f"opening message {self.similarity:.0%} alike")
             if self.depth:
                 why.append(f"{self.depth} earlier message{'s' if self.depth != 1 else ''} agree")
         else:
             why = [f"{self.depth} turn{'s' if self.depth != 1 else ''} aligned"]
+            if self.kind == "regenerate":
+                why.append(f"same question as message {self.regenerate_of} answered")
+            elif self.kind == "edit":
+                why.append("changed question: new branch")
         if self.continues:
             why.append("continue the reply")
         if self.exhaustive:
@@ -183,6 +281,9 @@ class TurnIndex:
     def __init__(self, max_turns: int = 2048, path: Optional[str] = None) -> None:
         self._turns: "OrderedDict[str, Turn]" = OrderedDict()  # cid -> Turn, oldest first
         self._by_first: Dict[str, Set[str]] = {}               # first-line hash -> cids
+        self._children: Dict[str, Set[str]] = {}               # parent cid -> cids
+        # Why the last lookup found nothing to resume, for the log.
+        self._last_miss = ""
         # Roots by the hash of the message just before theirs ("" when the
         # thread began with its very first message), for `_find_sibling`.
         self._roots_by_prev: Dict[str, Set[str]] = {}
@@ -203,6 +304,7 @@ class TurnIndex:
             self._turns.clear()
             self._by_first.clear()
             self._roots_by_prev.clear()
+            self._children.clear()
 
     def _save(self) -> None:
         """Write the index atomically; called with the lock held."""
@@ -233,6 +335,8 @@ class TurnIndex:
         self._by_first.setdefault(self._first(t.shape), set()).add(t.cid)
         if t.parent is None:
             self._roots_by_prev.setdefault(self._prev_key(t), set()).add(t.cid)
+        else:
+            self._children.setdefault(t.parent, set()).add(t.cid)
 
     @staticmethod
     def _unindex(table: Dict[str, Set[str]], key: str, cid: str) -> None:
@@ -249,13 +353,16 @@ class TurnIndex:
         self._unindex(self._by_first, self._first(t.shape), cid)
         if t.parent is None:
             self._unindex(self._roots_by_prev, self._prev_key(t), cid)
+        else:
+            self._unindex(self._children, t.parent, cid)
 
     # ---- writes -------------------------------------------------------------
     def remember(self, history: History, conversation_id: str,
                  parent: Optional[str], reply_fp: str, reply_text: str,
-                 account: str = "") -> None:
+                 account: str = "", user_mid: Optional[int] = None) -> None:
         """Record that `history` (a whole request) was answered from `parent`
-        and left the thread at `conversation_id`, under `account`."""
+        and left the thread at `conversation_id`, under `account`. `user_mid`
+        is DeepSeek's id of the user message that carried the turn."""
         if not conversation_id or ":" not in conversation_id or not history:
             return
         role, text, _ = history[-1]
@@ -268,7 +375,9 @@ class TurnIndex:
         t = Turn(cid=conversation_id, parent=parent, role=role,
                  shape=message_shape(text), reply_fp=reply_fp,
                  reply_head=reply_head(reply_text), sys_head=system_head(history),
-                 prefix=prefix, ts=time.time(), account=account)
+                 prefix=prefix, ts=time.time(), account=account,
+                 text=gist(text) if role in _ALIGNABLE else "",
+                 user_mid=user_mid)
         with self._lock:
             # An account is replaced, never revisited (it was muted); its
             # threads are dead and only clutter the index.
@@ -304,6 +413,9 @@ class TurnIndex:
         When no state can be resumed, `_find_sibling` looks for a thread that
         BEGAN with the message now being regenerated or edited, so the turn
         can at least stay in that chat as a new branch.
+
+        The match is then classified (`Match.kind`) by comparing the message
+        being sent with the turns already answered from that state.
         """
         n = len(history)
         if n < 1:
@@ -311,6 +423,7 @@ class TurnIndex:
         positions = _alignable(history)
         sys_h = system_head(history)
         with self._lock:
+            self._last_miss = ""
             for idx in range(len(positions) - 1, -1, -1):
                 j = positions[idx]
                 shape = message_shape(history[j][1])
@@ -351,19 +464,71 @@ class TurnIndex:
                         best = (rank, m)
                 if best:
                     self._turns.move_to_end(best[1].cid)
-                    return best[1]
-            return self._find_sibling(history, positions, sys_h, account)
+                    return self._classify(best[1], history)
+            m = self._find_sibling(history, positions, sys_h, account)
+            if m is None and not self._last_miss:
+                self._last_miss = "no known turn in this history"
+            return m
+
+    def last_miss(self) -> str:
+        """Why the last `find` returned nothing (for the log)."""
+        with self._lock:
+            return self._last_miss
+
+    def _classify(self, m: Match, history: History) -> Match:
+        """Decide what the client is doing to the matched state.
+
+        Only the message being sent can be a repeat or a rewrite of something
+        the state already answered, so this looks at the recorded children of
+        the state when that message is the only thing new. The same message
+        again is a regeneration of the newest such child; a different message
+        where a child exists is an edit; anything else is the next turn.
+        """
+        n = len(history)
+        if m.continues:
+            m.kind = "continue"
+            return m
+        if m.resume_from != n - 1:
+            return m  # several messages are new: nothing to compare with
+        role, text, _ = history[-1]
+        if role not in _ALIGNABLE or not text.strip():
+            return m
+        kids = [self._turns[c] for c in self._children.get(m.cid, ())
+                if self._turns[c].role == role]
+        if not kids:
+            return m
+        shape = message_shape(text)
+        same = [k for k in kids if compatible(k.shape, shape)]
+        if same:
+            k = max(same, key=lambda t: t.ts)
+            if k.message_id is not None:
+                m.kind, m.regenerate_of = "regenerate", k.message_id
+            return m
+        m.kind = "edit"
+        g = gist(text)
+        m.similarity = max((similarity(g, k.text) for k in kids if k.text),
+                           default=0.0)
+        return m
 
     def _find_sibling(self, history: History, positions: List[int],
                       sys_h: str, account: str) -> Optional[Match]:
         """A thread whose FIRST turn is the message now being sent again.
 
         Regenerating or editing a thread's opening turn has no earlier state to
-        resume: the thread began with that message. Rather than open yet
-        another chat, the turn is re-sent in full as a sibling branch of the
-        same chat (a bare session id resumes a session at its root). The
-        history before the message must agree with what the root remembers of
-        it, and the usual evidence rule applies.
+        resume: the thread began with that message. The history before the
+        message must agree with what the root remembers of it, and the usual
+        evidence rule applies. Then the message itself decides:
+
+        - the same message (a regeneration, or a swipe): DeepSeek's own
+          Regenerate on that root's reply, so the chat gains a second response
+          rather than a second copy of the question;
+        - a rewrite of it (similar text: an edit): re-sent in full as a new
+          branch of the same chat (a bare session id resumes a session at its
+          root);
+        - a different message: NOT this chat. Frontends open every chat from
+          the same card — same system prompt, same greeting — so a first turn
+          that merely shares that prefix is a new conversation and gets a new
+          chat, which is what the user sees on DeepSeek's side too.
         """
         n = len(history)
         role, text, _ = history[-1]
@@ -371,7 +536,10 @@ class TurnIndex:
             return None
         prev_key = message_hash(history[positions[-1]][1]) if positions else ""
         shape = message_shape(text)
+        g = gist(text)
+        now = time.time()
         best: Optional[Tuple[tuple, Match]] = None
+        nearest: Optional[Tuple[float, float, str]] = None  # (sim, need, cid)
         for cid in self._roots_by_prev.get(prev_key, ()):
             t = self._turns[cid]
             if t.account != account or t.role != role:
@@ -393,11 +561,28 @@ class TurnIndex:
             exhaustive = i < 0 and len(t.prefix) <= len(positions)
             if not (depth >= 2 or (sys_ok and (depth >= 1 or same))):
                 continue
+            sim = 1.0 if same else (similarity(g, t.text) if t.text else 0.0)
+            if same:
+                kind, regen = "regenerate", t.message_id
+            else:
+                need = edit_threshold(t.ts, now)
+                if sim < need:
+                    if nearest is None or sim > nearest[0]:
+                        nearest = (sim, need, t.cid)
+                    continue
+                kind, regen = "edit", None
             m = Match(cid=t.session, resume_from=0, depth=depth, sys=sys_ok,
-                      head=same, exhaustive=exhaustive, sibling=True)
-            rank = (depth, same, sys_ok, t.ts)
+                      head=same, exhaustive=exhaustive, sibling=True,
+                      kind=kind, regenerate_of=regen, similarity=sim)
+            rank = (same, sim, depth, sys_ok, t.ts)
             if best is None or rank > best[0]:
                 best = (rank, m)
+        if best is None and nearest is not None:
+            sim, need, cid = nearest
+            self._last_miss = (
+                f"first turn starts like chat {cid} but the opening message "
+                f"is only {sim:.0%} alike (an edit needs {need:.0%}): a new "
+                "conversation")
         return best[1] if best else None
 
     def _verify(self, t: Turn, history: History, positions: List[int],
