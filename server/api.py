@@ -283,6 +283,109 @@ class _Replayed:
         return getattr(self._stream, "request_message_id", None)
 
 
+# Refusals. A reply that opens with one of these and says little else is not
+# an answer to the message: once a chat branch has produced one, it keeps
+# producing it for whatever follows, while the same conversation sent afresh
+# from the chat's first message is usually answered normally. So a refusal is
+# treated as a poisoned branch, not as an answer — see `_RefusalGuard`. The
+# first two are DeepSeek's own canned texts (rendered by the web app, not
+# written by the model); the third is how the model itself declines a
+# roleplay. Override or extend with DEEPSEEK_REFUSAL_TEXTS, "|"-separated.
+REFUSAL_TEXTS = tuple(
+    t.strip() for t in os.getenv(
+        "DEEPSEEK_REFUSAL_TEXTS",
+        "Sorry, that's beyond my current scope. Let's talk about something else."
+        "|I am sorry, I cannot answer that question. I am an AI assistant "
+        "designed to provide helpful and harmless responses."
+        "|I'm not able to continue with this roleplay"
+    ).split("|") if t.strip())
+# A reply that opens with a refusal but runs on past this is saying something
+# of its own (a refusal plus an actual answer, or a scene that begins with
+# those words) and is delivered as it is.
+REFUSAL_MAX_LEN = int(os.getenv("DEEPSEEK_REFUSAL_MAX_LEN", "400"))
+# Reasoning beyond this is not leading up to a refusal (refusals have none).
+_REFUSAL_THINK_CAP = 2000
+
+
+def _norm(text: str) -> str:
+    return " ".join(text.replace("’", "'").split()).lower()
+
+
+def is_refusal(text: str) -> bool:
+    """Whether `text` is a refusal and nothing else (see REFUSAL_TEXTS)."""
+    t = _norm(text)
+    return len(t) <= REFUSAL_MAX_LEN and any(t.startswith(_norm(r)) for r in REFUSAL_TEXTS)
+
+
+def _could_be_refusal(text: str) -> bool:
+    """Whether `text` so far could still turn out to be a refusal."""
+    t = _norm(text)
+    if len(t) > REFUSAL_MAX_LEN:
+        return False
+    return any(_norm(r).startswith(t) or t.startswith(_norm(r)) for r in REFUSAL_TEXTS)
+
+
+class _RefusalGuard:
+    """A stream held back until it is clear the reply is not a refusal.
+
+    `decide()` reads events, buffering them, until the reply text can no
+    longer be the canned refusal (it diverged, or grew past it, or came with
+    real reasoning) — usually within the first few chunks — or the stream
+    ends. Only then does anything reach the client, so a refused turn can be
+    retried invisibly. `events()` replays the buffer and continues.
+    """
+
+    def __init__(self, stream):
+        self._stream = stream
+        self._buffer: list = []
+        self._rest = None
+        self.refused = False
+        self.text = ""  # the reply text read so far
+        self._decided = False
+
+    def decide(self) -> bool:
+        """Consume until the verdict is known; True when the reply is a refusal."""
+        if self._decided:
+            return self.refused
+        self._decided = True
+        text, think = [], 0
+        it = iter(self._stream.events())
+        for event in it:
+            self._buffer.append(event)
+            kind, chunk = event
+            if kind == "thinking":
+                think += len(chunk)
+                if think > _REFUSAL_THINK_CAP:
+                    break
+                continue
+            text.append(chunk)
+            if not _could_be_refusal("".join(text)):
+                break
+        else:
+            # The stream ended while still looking like a refusal.
+            self.text = "".join(text)
+            self.refused = is_refusal(self.text)
+            return self.refused
+        self.text = "".join(text)
+        self._rest = it
+        return False
+
+    def events(self):
+        if not self._decided:
+            self.decide()
+        yield from self._buffer
+        if self._rest is not None:
+            yield from self._rest
+
+    @property
+    def conversation_id(self):
+        return self._stream.conversation_id
+
+    @property
+    def request_message_id(self):
+        return getattr(self._stream, "request_message_id", None)
+
+
 # A muted account cannot be un-muted from here — the only fix is a fresh one.
 # When an upstream error says "user is muted", the server drops a flag file
 # and shuts itself down; bin/start (a supervisor loop) sees the flag, runs the
@@ -623,9 +726,21 @@ async def chat_completions(req: ChatCompletionRequest, request: Request):
             or "chat session" in text and "not" in text
         )
 
+    def upload_all_images() -> list:
+        """Every image in the request, for a turn re-sent as the whole history."""
+        return [client.upload_file(data, filename, mime)
+                for filename, mime, data in message_images(req.messages)]
+
+    def refusal_retry_target(cid: str | None) -> str | None:
+        """Where a refused turn is re-sent: the root of its chat (bare session
+        id), i.e. as an edit of the chat's first message carrying the whole
+        history — the branch that refused is left behind."""
+        session = _session_of(cid)
+        return session or None
+
     if req.stream:
         def gen():
-            nonlocal client, account
+            nonlocal client, account, conversation_id, parent_cid
             try:
                 files = upload_images()
 
@@ -668,6 +783,26 @@ async def chat_completions(req: ChatCompletionRequest, request: Request):
                     first = None
                 if first is not None:
                     stream = _Replayed(stream, peeked, first)
+                # Hold the reply back until it is clearly not the canned
+                # refusal; a refusal is retried as an edit of the chat's first
+                # message before the client sees anything.
+                stream = _RefusalGuard(stream)
+                if stream.decide():
+                    root = refusal_retry_target(stream.conversation_id)
+                    debuglog.log_thread(
+                        f"DeepSeek refused this turn ({stream.text[:60]!r}); "
+                        f"editing the first message of chat {root}: resending "
+                        f"the whole history as a new branch from its root")
+                    conversation_id = parent_cid = root
+                    stream = _RefusalGuard(client.stream(
+                        fresh_prompt, conversation_id=root, model=None,
+                        thinking=thinking, search=req.search,
+                        ref_file_ids=upload_all_images(),
+                    ))
+                    if stream.decide():
+                        debuglog.log_thread(
+                            "DeepSeek refused the edited first message too; "
+                            "passing the refusal on")
                 include_usage = bool(req.stream_options and req.stream_options.get("include_usage"))
                 yield from stream_chunks(
                     req.model, stream,
@@ -759,6 +894,25 @@ async def chat_completions(req: ChatCompletionRequest, request: Request):
         return _error(str(e), status=503, err_type="overloaded_error")
     except Exception as e:
         return _error(f"DeepSeek request failed: {e}")
+
+    if is_refusal(reply.text):
+        # Same recovery as the streaming path: the branch is poisoned, so the
+        # whole history goes again as an edit of the chat's first message.
+        root = refusal_retry_target(reply.conversation_id)
+        debuglog.log_thread(
+            f"DeepSeek refused this turn ({reply.text[:60]!r}); editing "
+            f"the first message of chat {root}: resending the whole history as "
+            f"a new branch from its root")
+        conversation_id = parent_cid = root
+        try:
+            reply = await run_in_threadpool(lambda: client.chat(
+                fresh_prompt, root, None, thinking, req.search,
+                upload_all_images()))
+        except Exception as e:
+            return _error(f"DeepSeek request failed: {e}")
+        if is_refusal(reply.text):
+            debuglog.log_thread("DeepSeek refused the edited first message too; "
+                                "passing the refusal on")
 
     # Split off an emulated tool call before leak-stripping: tool arguments may
     # embed file contents whose lines would otherwise look like a leaked turn.

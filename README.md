@@ -536,6 +536,20 @@ This is deliberately loose about everything frontends rewrite between turns:
   fresh one, the dead threads are skipped and pruned instead of each costing
   a failed resume.
 
+**A refusal is a poisoned branch, not an answer.** When DeepSeek answers a
+turn with one of its canned refusals ("Sorry, that's beyond my current scope.
+Let's talk about something else.", "I am sorry, I cannot answer that
+question...") or the model declines to go on with a roleplay ("I'm not able to
+continue with this roleplay..."), the same branch keeps refusing whatever
+comes next, while the same conversation sent afresh usually gets a normal
+reply. So the reply is held back until it is clearly not a refusal — a few
+chunks, at most 400 characters — and a refused turn is re-sent, before the
+client sees anything, as an edit of the chat's first message carrying the
+whole history: a new branch from the chat's root, leaving the refusing branch
+behind. If that is refused as well, the refusal is delivered. The phrases are
+`DEEPSEEK_REFUSAL_TEXTS` ("|"-separated) and the length cap
+`DEEPSEEK_REFUSAL_MAX_LEN`.
+
 **Injected notes are stated once, and never parroted.** Roleplay frontends
 append instruction lines to every outgoing message (`SYSTEM NOTE: Do not
 include the following words...`, `[OOC: ...]`). Sent on every turn, the note
