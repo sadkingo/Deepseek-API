@@ -505,8 +505,17 @@ This is deliberately loose about everything frontends rewrite between turns:
   Regenerate on that answer: the chat gains a second *response* to the same
   question, exactly as the Regenerate button does, rather than a second copy
   of the question. Whichever swipe the client keeps is recognised by its
-  opening on the next turn. If DeepSeek refuses the regeneration (it has a
-  per-message quota) the turn goes out as a new branch instead.
+  opening on the next turn.
+- **A regeneration DeepSeek will not do becomes a branch.** Regenerating has
+  quotas — a per-message one (`ban_regenerate`), and an account-wide one that
+  answers in about a second with "Editing/regeneration too frequently. Try
+  again later." (`regeneration_rate_limit`). Ordinary completions are not
+  covered by it, *including the ones that branch a chat*, so the swipe is
+  simply sent from the state before the answer instead: the same question
+  again as a sibling turn. Nothing reaches the client but the reply. The
+  account-wide verdict also silences the regenerate endpoint for five minutes
+  (`DEEPSEEK_REGEN_COOLDOWN`), so later swipes branch straight away rather
+  than spending a round trip to be told the same thing.
 - **Edits resume from before the edit.** A changed message anywhere in the
   history rejects every thread state that was built on the old wording; the
   lookup falls back to the last state that agrees and resends from there.
@@ -531,6 +540,10 @@ This is deliberately loose about everything frontends rewrite between turns:
 - **Edits deeper in a chat branch from before the edit.** A changed version of
   a question the thread already answered is sent from the state before it, so
   DeepSeek shows it as an edited message with the old version kept.
+- **A branch DeepSeek will not take opens a new chat.** If that quota ever
+  covers branching too, an edited question or a re-sent first turn has
+  nowhere to go inside its chat, so the whole history goes out as a chat of
+  its own — which is not an edit, and therefore not subject to the quota.
 - **A replaced account's threads are never tried.** Every recorded turn is
   tagged with the signed-in account; after a muted account is swapped for a
   fresh one, the dead threads are skipped and pruned instead of each costing

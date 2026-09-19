@@ -40,8 +40,8 @@ from starlette.requests import Request
 
 from . import debuglog
 from deepseek.auth import LoginRequired, relogin
-from deepseek.client import (DeepSeekClient, PoisonedThread, RateLimited,
-                             ServerBusy, UpstreamGaveUp)
+from deepseek.client import (DeepSeekClient, EditRateLimited, PoisonedThread,
+                             RateLimited, ServerBusy, UpstreamGaveUp)
 
 from .config import (
     API_KEY,
@@ -816,6 +816,24 @@ async def chat_completions(req: ChatCompletionRequest, request: Request):
                         stream = open_stream()
                         first = iter(stream.events())
                         peeked = next(first, None)
+                except EditRateLimited as e:
+                    # Not the swipe itself (the client branches instead of
+                    # regenerating): this is a branch — an edited question, or
+                    # a first turn re-sent at the chat's root — that DeepSeek
+                    # would not take either. The same history in a chat of its
+                    # own is not an edit at all, so it goes through.
+                    debuglog.log_thread(
+                        f"{e.content or e}; DeepSeek will not branch chat "
+                        f"{_session_of(conversation_id)} right now, so this "
+                        "turn opens a new chat with the whole history")
+                    conversation_id = parent_cid = None
+                    stream = client.stream(
+                        fresh_prompt, conversation_id=None,
+                        model=resolve_model_type(req.model), thinking=thinking,
+                        search=req.search, ref_file_ids=upload_all_images(),
+                    )
+                    peeked = None
+                    first = None
                 except PoisonedThread as e:
                     # The state we would continue from was refused by
                     # DeepSeek's moderation after the fact; anything sent
@@ -843,7 +861,7 @@ async def chat_completions(req: ChatCompletionRequest, request: Request):
                     stream = client.stream(
                         fresh_prompt, conversation_id=None,
                         model=resolve_model_type(req.model), thinking=thinking,
-                        search=req.search, ref_file_ids=files,
+                        search=req.search, ref_file_ids=upload_all_images(),
                     )
                     peeked = None
                     first = None
@@ -921,9 +939,10 @@ async def chat_completions(req: ChatCompletionRequest, request: Request):
                            regenerate_of=regenerate_of)
 
     def run_chat_fresh():
-        """Same turn, but as a brand-new thread from the full history."""
+        """Same turn, but as a brand-new thread from the full history — so
+        every image in the request goes with it, not just the newest turn's."""
         return client.chat(fresh_prompt, None, resolve_model_type(req.model),
-                           thinking, req.search, upload_images())
+                           thinking, req.search, upload_all_images())
 
     def run_chat_relogin():
         """The token was rejected: sign in again, then the same turn again."""
@@ -941,6 +960,15 @@ async def chat_completions(req: ChatCompletionRequest, request: Request):
                     raise
                 debuglog.log_error(f"upstream rejected the token ({e})")
                 reply = await run_in_threadpool(run_chat_relogin)
+        except EditRateLimited as e:
+            # Same as the streaming path: a branch DeepSeek will not take
+            # right now becomes a chat of its own, which is not an edit.
+            debuglog.log_thread(
+                f"{e.content or e}; DeepSeek will not branch chat "
+                f"{_session_of(conversation_id)} right now, so this turn "
+                "opens a new chat with the whole history")
+            conversation_id = parent_cid = None
+            reply = await run_in_threadpool(run_chat_fresh)
         except PoisonedThread as e:
             root = refusal_retry_target(conversation_id)
             debuglog.log_thread(

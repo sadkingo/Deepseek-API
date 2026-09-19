@@ -69,6 +69,10 @@ EMPTY_RETRY_DELAY = float(os.getenv("DEEPSEEK_EMPTY_RETRY_DELAY", "2"))
 # One web account can't usefully serve more anyway (DeepSeek muted this account
 # once already for request spam), and the bound means a burst of retries piles
 # up as quick, visible errors instead of an ever-growing queue of stuck threads.
+# How long to stop using the regenerate endpoint after DeepSeek says its
+# edit/regeneration quota is spent. Swipes are branched instead meanwhile,
+# which is unaffected by that quota (verified 2026-09-19).
+REGEN_COOLDOWN = float(os.getenv("DEEPSEEK_REGEN_COOLDOWN", "300"))
 MAX_CONCURRENCY = int(os.getenv("DEEPSEEK_MAX_CONCURRENCY", "4"))
 QUEUE_TIMEOUT = float(os.getenv("DEEPSEEK_QUEUE_TIMEOUT", "45"))
 
@@ -297,6 +301,7 @@ class DeepSeekClient:
         # Wedge detection (see `wedged`): how many requests hold a gate slot,
         # and when anything last moved (slot taken/released, SSE chunk arrived).
         self._pacer = _Pacer()
+        self._edit_quota = _EditQuota()
         self._inflight = 0
         self._progress_ts = time.time()
         self._state_lock = threading.Lock()
@@ -635,11 +640,20 @@ class _Stream:
     def _attempt(self, meta: dict) -> Iterator[tuple]:
         """One upstream request; yields its events and fills `meta`.
 
-        A regeneration that DeepSeek refuses outright (its per-message quota,
-        a message it will not regenerate) falls back to an ordinary completion
-        from the same state, so the turn is answered either way — as a new
-        branch rather than a new response version.
+        A regeneration DeepSeek will not do — a message it refuses outright
+        (its per-message quota, `ban_regenerate`) or the account's spent
+        edit/regeneration quota — falls back to an ordinary completion from
+        the same state, so the turn is answered either way: as a new branch
+        rather than as another response under the same question. While the
+        account's quota is spent the endpoint is skipped altogether, since it
+        would cost a round trip per swipe to be told the same thing.
         """
+        if self._regenerate_of is not None and self._client._edit_quota.spent():
+            _log.info("regenerate of message %s skipped: DeepSeek's "
+                      "edit/regeneration quota is spent; branching instead",
+                      self._regenerate_of)
+            self._regenerate_of = None
+            meta.clear()
         if self._regenerate_of is not None:
             produced = False
             try:
@@ -653,6 +667,18 @@ class _Stream:
                     produced = True
                     yield event
                 return
+            except EditRateLimited as e:
+                if produced:
+                    raise
+                # Only the regenerate endpoint is limited; branching is not.
+                self._client._edit_quota.note()
+                _log.warning("regenerate of message %s hit DeepSeek's "
+                             "edit/regeneration quota (%s); sending the turn "
+                             "as a new branch instead, and leaving the "
+                             "endpoint alone for %.0fs",
+                             self._regenerate_of, e.content, REGEN_COOLDOWN)
+                self._regenerate_of = None
+                meta.clear()
             except RuntimeError as e:
                 if produced or "rejected the request" not in str(e):
                     raise
@@ -882,6 +908,47 @@ class UpstreamGaveUp(RuntimeError):
     "DeepSeek is overloaded" from "the proxy broke".
     """
 
+    def __init__(self, message: str, reason: str = "", content: str = ""):
+        super().__init__(message)
+        self.reason = reason
+        self.content = content
+
+
+class EditRateLimited(UpstreamGaveUp):
+    """The account's edit/regeneration quota is spent ("Editing/regeneration
+    too frequently. Try again later.", finish_reason "regeneration_rate_limit").
+
+    It arrives within a second or two and covers the regenerate endpoint only:
+    ordinary completions, including the ones that branch a chat (an edit, or a
+    new root in the same chat), keep working (verified 2026-09-19). So a swipe
+    is sent as a branch instead, and the endpoint is left alone for a while.
+    """
+
+
+# finish_reasons that mean the edit/regeneration quota, not a broken request.
+_EDIT_QUOTA_REASONS = ("regeneration_rate_limit", "edit_rate_limit")
+
+
+class _EditQuota:
+    """Remembers that DeepSeek's edit/regeneration quota is spent, so the
+    regenerate endpoint is skipped rather than retried on every swipe."""
+
+    def __init__(self) -> None:
+        self._until = 0.0
+        self._lock = threading.Lock()
+
+    def spent(self) -> bool:
+        with self._lock:
+            return time.time() < self._until
+
+    def note(self, cooldown: float = REGEN_COOLDOWN) -> None:
+        with self._lock:
+            self._until = max(self._until, time.time() + cooldown)
+
+    def clear(self) -> None:
+        with self._lock:
+            self._until = 0.0
+
 
 def _parse_sse(lines, meta: Optional[dict] = None) -> Iterator[tuple]:
     """See `_parse_sse_frames`; this wrapper adds forensics for empty streams.
@@ -991,8 +1058,10 @@ def _parse_sse_frames(lines, meta: Optional[dict] = None) -> Iterator[tuple]:
                 reason = obj.get("finish_reason") or "error"
                 content = obj.get("content") or "no details"
                 _log.warning("upstream gave up: %s (%s)", content, reason)
-                raise UpstreamGaveUp(
-                    f"DeepSeek gave up on the request ({reason}): {content}")
+                cls = (EditRateLimited if reason in _EDIT_QUOTA_REASONS
+                       else UpstreamGaveUp)
+                raise cls(f"DeepSeek gave up on the request ({reason}): "
+                          f"{content}", reason=reason, content=content)
             continue
         event_name = None
 

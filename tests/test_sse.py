@@ -100,3 +100,32 @@ class ContentFilterTests(unittest.TestCase):
         self.assertFalse(DeepSeekClient._refused_by_moderation(msgs, 8))
         self.assertFalse(DeepSeekClient._refused_by_moderation(msgs, 99))
         self.assertFalse(DeepSeekClient._refused_by_moderation(None, 6))
+
+
+class EditQuotaTests(unittest.TestCase):
+    """DeepSeek's "Editing/regeneration too frequently" verdict."""
+
+    def _hint(self, reason):
+        return _stream(
+            "event: ready",
+            'data: {"request_message_id":1,"response_message_id":3}',
+            "event: hint",
+            'data: {"type":"error","content":"Editing/regeneration too frequently. '
+            'Try again later.","clear_response":true,"finish_reason":"%s"}' % reason,
+            "event: close",
+            'data: {"click_behavior":"retry"}',
+        )
+
+    def test_quota_hint_raises_its_own_type(self):
+        from deepseek.client import EditRateLimited, UpstreamGaveUp
+        with self.assertRaises(EditRateLimited) as ctx:
+            list(_parse_sse(self._hint("regeneration_rate_limit"), {}))
+        self.assertIsInstance(ctx.exception, UpstreamGaveUp)  # still a 503 upstream
+        self.assertEqual(ctx.exception.reason, "regeneration_rate_limit")
+        self.assertIn("too frequently", ctx.exception.content)
+
+    def test_other_give_ups_are_not_the_quota(self):
+        from deepseek.client import EditRateLimited, UpstreamGaveUp
+        with self.assertRaises(UpstreamGaveUp) as ctx:
+            list(_parse_sse(self._hint("generation_timeout"), {}))
+        self.assertNotIsInstance(ctx.exception, EditRateLimited)
