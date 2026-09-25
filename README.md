@@ -577,6 +577,16 @@ the client kept in its history left out of the replay:
 The canned phrases are `DEEPSEEK_REFUSAL_TEXTS` ("|"-separated) and the
 length cap `DEEPSEEK_REFUSAL_MAX_LEN`.
 
+**The client looks like the Chrome that signed in.** Every request carries
+the user agent saved with the session, so the rest of the browser identity is
+derived from it rather than pinned: the TLS and HTTP/2 fingerprint is the
+newest curl_cffi target not newer than that Chrome (`chrome146` for a Chrome
+148 session, `chrome150` for 154; override with `CURL_IMPERSONATE`), and
+`Sec-CH-UA` is computed with Chromium's own per-version algorithm for the
+decoy brand and brand order. A token captured from a headless window never
+saves `HeadlessChrome` as the user agent: it is stored as the `Chrome` it is,
+and an old session file is cleaned when it is loaded.
+
 **Injected notes are stated once, and never parroted.** Roleplay frontends
 append instruction lines to every outgoing message (`SYSTEM NOTE: Do not
 include the following words...`, `[OOC: ...]`). Sent on every turn, the note

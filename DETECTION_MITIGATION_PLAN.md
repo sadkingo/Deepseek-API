@@ -52,7 +52,7 @@ Before implementing individual fixes, evaluate the two primary architectural app
 |                          ARCHITECTURAL COMPARISON                           |
 +-----------------------------------------------------------------------------+
 | Strategy A: Protocol Hardening (Pure Python Engine)                         |
-|   • Transport: curl_cffi (Chrome 131 BoringSSL impersonation)               |
+|   • Transport: curl_cffi (BoringSSL impersonation of the session's Chrome)  |
 |   • Timing: Artificial V8 event-loop latency simulation                     |
 |   • Token Maintenance: Periodic headless Playwright sidecar                 |
 |   • Pros: Minimal RAM (~80MB), fast streaming, fully headless/CLI           |
@@ -92,8 +92,10 @@ from curl_cffi import requests
 
 class DeepSeekClient:
     def __init__(self, session: Optional[Session] = None, timeout: float = 60.0):
-        # Impersonate Chrome 131: exact BoringSSL TLS ClientHello + HTTP/2 frame stack
-        self._http = requests.Session(impersonate="chrome131")
+        # Impersonate the Chrome the session was captured with (newest curl_cffi
+        # target not newer than it, e.g. chrome146 for Chrome 148): exact
+        # BoringSSL TLS ClientHello + HTTP/2 frame stack. See impersonation_target().
+        self._http = requests.Session(impersonate=impersonation_target(ua))
         self._timeout = int(timeout)
         self.session = session or get_session()
         

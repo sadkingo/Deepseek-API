@@ -54,6 +54,15 @@ LAUNCH_ARGS = ["--disable-blink-features=AutomationControlled"]
 SESSION_MAX_AGE = 6 * 60 * 60  # 6 hours
 
 
+def clean_user_agent(ua: str) -> str:
+    """The user agent a real, windowed Chrome of the same version sends.
+
+    Headless Chrome reports itself as "HeadlessChrome/<version>" and is
+    otherwise identical; that one word is the most common bot marker there is.
+    """
+    return (ua or "").replace("HeadlessChrome/", "Chrome/")
+
+
 class LoginRequired(RuntimeError):
     """Raised when no usable session exists and interactive login is disallowed
     (e.g. inside the server, where we can't pop open a browser mid-request).
@@ -78,6 +87,12 @@ class Session:
     cookies: Dict[str, str]
     user_agent: str
     captured_at: float
+
+    def __post_init__(self) -> None:
+        # Every request the HTTP client makes carries this string, so a token
+        # captured from a headless window must not stamp "HeadlessChrome" on
+        # all of them. Applied on capture and on load, so an old file heals.
+        self.user_agent = clean_user_agent(self.user_agent)
 
     @property
     def age(self) -> float:

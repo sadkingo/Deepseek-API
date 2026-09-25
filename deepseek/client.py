@@ -260,10 +260,72 @@ def _biz(data: dict) -> dict:
     return biz
 
 
+def chrome_major(ua: str, default: int = 131) -> int:
+    """The Chrome major version a user agent claims."""
+    match = re.search(r"Chrome/(\d+)", ua or "")
+    return int(match.group(1)) if match else default
+
+
+# Chromium's "GREASE" brand for Sec-CH-UA, exactly as the browser derives it
+# from its major version (components/embedder_support/user_agent_utils.cc):
+# the decoy brand's punctuation, its version and the order of all three brands
+# change with every release. A fixed decoy is right for one version only and
+# wrong for every other, which is an easy tell next to the real version number.
+_GREASE_CHARS = (" ", "(", ":", "-", ".", "/", ")", ";", "=", "?", "_")
+_GREASE_VERSIONS = ("8", "99", "24")
+_BRAND_ORDERS = ((0, 1, 2), (0, 2, 1), (1, 0, 2), (1, 2, 0), (2, 0, 1), (2, 1, 0))
+
+
+def sec_ch_ua(major: int) -> str:
+    """The Sec-CH-UA header Google Chrome `major` sends."""
+    n = len(_GREASE_CHARS)
+    grease = (f"Not{_GREASE_CHARS[major % n]}A"
+              f"{_GREASE_CHARS[(major + 1) % n]}Brand",
+              _GREASE_VERSIONS[major % len(_GREASE_VERSIONS)])
+    order = _BRAND_ORDERS[major % len(_BRAND_ORDERS)]
+    brands: list = [None, None, None]
+    brands[order[0]] = grease
+    brands[order[1]] = ("Chromium", str(major))
+    brands[order[2]] = ("Google Chrome", str(major))
+    return ", ".join(f'"{b}";v="{v}"' for b, v in brands)
+
+
+def _impersonation_targets() -> list:
+    """(major, target) for every desktop Chrome curl_cffi can imitate."""
+    try:
+        from curl_cffi.requests.impersonate import BrowserType
+        names = [b.value for b in BrowserType]
+    except Exception:
+        names = ["chrome120", "chrome124", "chrome131", "chrome136"]
+    out = []
+    for name in names:
+        m = re.fullmatch(r"chrome(\d+)(a?)", name)
+        if m:
+            # The plain build wins a tie with its "a" variant.
+            out.append((int(m.group(1)), m.group(2) == "", name))
+    return [(major, name) for major, _, name in sorted(out)]
+
+
+def impersonation_target(ua: str) -> str:
+    """The curl_cffi fingerprint closest to the Chrome in `ua`: the newest one
+    that is not newer than it. Chrome's TLS and HTTP/2 fingerprint changes
+    rarely between releases, so a slightly older build is indistinguishable,
+    whereas the one this client used to pin (131) is far behind a 148 or 154
+    user agent. CURL_IMPERSONATE overrides it."""
+    forced = os.getenv("CURL_IMPERSONATE")
+    if forced:
+        return forced
+    major = chrome_major(ua)
+    targets = _impersonation_targets()
+    fitting = [name for m, name in targets if m <= major]
+    if fitting:
+        return fitting[-1]
+    return targets[0][1] if targets else "chrome131"
+
+
 def _client_hints(ua: str) -> dict:
     """Generate Sec-CH-UA and Sec-Fetch headers consistent with user agent."""
-    match = re.search(r"Chrome/(\d+)", ua)
-    major = match.group(1) if match else "131"
+    major = chrome_major(ua)
     platform = '"Windows"'
     if "Linux" in ua:
         platform = '"Linux"'
@@ -271,7 +333,7 @@ def _client_hints(ua: str) -> dict:
         platform = '"macOS"'
 
     return {
-        "sec-ch-ua": f'"Chromium";v="{major}", "Google Chrome";v="{major}", "Not=A?Brand";v="24"',
+        "sec-ch-ua": sec_ch_ua(major),
         "sec-ch-ua-mobile": "?0",
         "sec-ch-ua-platform": platform,
         "sec-fetch-dest": "empty",
@@ -312,17 +374,20 @@ class DeepSeekClient:
 
         self._use_curl = False
         if curl_requests is not None and USE_CURL_CFFI:
+            target = impersonation_target(self.session.user_agent)
             try:
                 self._http = curl_requests.Session(
                     base_url=BASE,
-                    impersonate="chrome131",
+                    impersonate=target,
                     headers=self._base_headers(),
                     cookies=self.session.cookies,
                     proxies=proxies,
                     timeout=60,
                 )
                 self._use_curl = True
-                _log.info("Using curl_cffi transport impersonating Chrome 131 (BoringSSL/HTTP2)")
+                _log.info("Using curl_cffi transport impersonating %s for a "
+                          "Chrome %d user agent (BoringSSL/HTTP2)", target,
+                          chrome_major(self.session.user_agent))
             except Exception as e:
                 _log.warning("curl_cffi initialization failed, falling back to httpx: %s", e)
 
