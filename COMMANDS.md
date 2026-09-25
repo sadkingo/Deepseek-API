@@ -67,9 +67,12 @@ cd ~/Desktop/Deepseek-API && rm -rf session && source venv/bin/activate && pytho
 
 ## Register a fresh account
 
-Creates a brand-new DeepSeek account automatically (SeleniumBase + Gmail) and
-saves its session into this project. This is the sign-up automation in
-`~/Desktop/Create account deepseek`, not part of this repo.
+Creates a brand-new DeepSeek account automatically and saves its session into
+this project. It runs your installed Google Chrome as a normal browser (a fresh
+profile, no chromedriver, no automation flags), types and clicks with real
+input events, and reads the verification code from Gmail. This is the sign-up
+automation in `~/Desktop/Create account deepseek`, not part of this repo;
+`REGISTER_BROWSER=uc register` falls back to the old SeleniumBase browser.
 
 ```bash
 register
