@@ -7,8 +7,8 @@
 # session being reused. Losing it costs only one browser sign-in, but it IS
 # discarded, so say so before doing it.
 #
-# Not to be confused with the global `register`, which creates a brand-new
-# account automatically (~/Desktop/Create account deepseek).
+# Not to be confused with `register` (bin/register), which creates a brand-new
+# account automatically through the Chrome extension.
 set -euo pipefail
 
 cd "$(dirname "$(readlink -f "$0")")/.."

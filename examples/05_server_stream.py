@@ -24,7 +24,7 @@ import json
 
 import requests
 
-URL = "http://localhost:8000/v1/chat/completions"
+URL = "http://localhost:8010/v1/chat/completions"
 
 with requests.post(URL, json={
     "model": "deepseek-chat",

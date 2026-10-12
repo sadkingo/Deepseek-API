@@ -29,7 +29,7 @@ import re
 import threading
 import time
 from dataclasses import dataclass
-from typing import Iterator, Optional
+from typing import Dict, Iterator, Optional
 
 import httpx
 
@@ -440,6 +440,21 @@ class DeepSeekClient:
             _log.debug("thread navigation simulation skipped: %s", e)
             return None
 
+    def reply_texts(self, chat_session_id: str) -> Optional[Dict[int, str]]:
+        """The text of every assistant message in a chat, by message id, as
+        DeepSeek stores it (reasoning and tips left out); None when the chat
+        could not be read."""
+        messages = self._simulate_thread_navigation(chat_session_id)
+        if messages is None:
+            return None
+        out: Dict[int, str] = {}
+        for m in messages:
+            if m.get("role") == "ASSISTANT" and isinstance(m.get("message_id"), int):
+                out[m["message_id"]] = "".join(
+                    f.get("content") or "" for f in m.get("fragments") or []
+                    if f.get("type") == "RESPONSE")
+        return out
+
     @staticmethod
     def _refused_by_moderation(messages: Optional[list], message_id: Optional[int]) -> bool:
         """Whether `message_id` in a history listing was content-filtered."""
@@ -712,6 +727,12 @@ class _Stream:
         rather than as another response under the same question. While the
         account's quota is spent the endpoint is skipped altogether, since it
         would cost a round trip per swipe to be told the same thing.
+
+        A message regenerated too often ("Regeneration limit reached", after
+        six regenerations of one message) is answered the way a person gets
+        past it in the web app: by editing the message - the same text with a
+        space added - which opens a new branch with a fresh allowance. The
+        next swipe then regenerates that branch.
         """
         if self._regenerate_of is not None and self._client._edit_quota.spent():
             _log.info("regenerate of message %s skipped: DeepSeek's "
@@ -743,6 +764,17 @@ class _Stream:
                              "endpoint alone for %.0fs",
                              self._regenerate_of, e.content, REGEN_COOLDOWN)
                 self._regenerate_of = None
+                meta.clear()
+            except UpstreamGaveUp as e:
+                if produced or e.reason not in _REGEN_LIMIT_REASONS:
+                    raise
+                _log.warning("message %s of chat %s has reached DeepSeek's "
+                             "regeneration limit (%s); editing the last message "
+                             "instead: the same text with a space added, as a "
+                             "new branch", self._regenerate_of,
+                             self._session_id, e.content)
+                self._regenerate_of = None
+                self._prompt = f"{self._prompt} "
                 meta.clear()
             except RuntimeError as e:
                 if produced or "rejected the request" not in str(e):
@@ -992,6 +1024,9 @@ class EditRateLimited(UpstreamGaveUp):
 
 # finish_reasons that mean the edit/regeneration quota, not a broken request.
 _EDIT_QUOTA_REASONS = ("regeneration_rate_limit", "edit_rate_limit")
+# The per-message cap: this one message has been regenerated too often
+# ("Regeneration limit reached"). An edit of the message is not capped.
+_REGEN_LIMIT_REASONS = ("regeneration_limit",)
 
 
 class _EditQuota:

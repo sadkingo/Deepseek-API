@@ -19,8 +19,19 @@ between turns:
 - once the context window fills, the OLDEST messages are dropped, so the
   history no longer starts where the thread did;
 - any earlier message may be edited, a reply may be regenerated ("swiped") and
-  either version kept, the assistant's prose is our own output and may come
-  back reshaped.
+  either version kept, and a reply may be edited by the user before the chat
+  goes on (a roleplay frontend lets you rewrite the character's last message).
+
+An edited reply matters: DeepSeek's thread still holds the reply as it was
+generated, so continuing it would make the model build on text the user has
+taken out. Every turn therefore remembers a hash of its whole reply, and of
+every assistant message that went to DeepSeek inside its prompt (the greeting
+and history flattened into a chat's first prompt, a reply resent after an
+edit). A state whose replies the client no longer has verbatim is not
+resumed: the thread is picked up from the state before the change, and the
+rest of the history - with the edited text - is resent from there. Records
+made before reply hashes existed are filled in from DeepSeek's own copy of
+the chat (`unhashed`, `fill_reply_hashes`) before they are relied on.
 
 Hashing whole prefixes survives none of that. This module instead keeps every
 turn we answered as a record in a tree — each record knows the thread state it
@@ -121,6 +132,25 @@ def reply_head(text: str) -> str:
     return _h(" ".join(text.split())[:_REPLY_HEAD])
 
 
+# A reply hash that could not be filled in (DeepSeek no longer has the
+# message): never compared, and never looked up again.
+UNKNOWN_REPLY = "?"
+
+_THINK = re.compile(r"^\s*<think>.*?</think>", re.S)
+
+
+def reply_key(text: str) -> str:
+    """Hash of a whole reply, for telling whether the client edited it.
+
+    Tool calls are compared through the fingerprint, and whitespace and a
+    leading <think> block are what frontends rewrite without the user doing
+    anything, so none of those count; any change to the words does."""
+    if "<function_call" in text:
+        text = text[: text.index("<function_call")]
+    text = _THINK.sub("", text)
+    return _h(" ".join(text.split()))
+
+
 def gist(text: str) -> str:
     """A message reduced to what the user wrote: the note lines a frontend
     appended are dropped (they are identical on every turn and would make any
@@ -188,9 +218,12 @@ class Turn:
     reply_fp: str              # tool calls in our reply ("" if none)
     reply_head: str            # hash of our reply's opening
     sys_head: str              # hash of the system prompt's opening
-    prefix: List[str] = field(default_factory=list)  # roots: hashes of the
-    #   alignable messages that were flattened into the first prompt, oldest
-    #   first, so the history before a root can still be checked
+    prefix: List[str] = field(default_factory=list)  # hashes of the alignable
+    #   messages sent in the same prompt BEFORE the one that carried the turn,
+    #   oldest first: for a root, the history flattened into its first prompt;
+    #   for any other turn, the messages resent after a gap (an edited reply,
+    #   a turn we never saw). They let the history before the turn be checked
+    #   and let the turn be recognised when it is regenerated.
     ts: float = 0.0
     account: str = ""          # which DeepSeek account owns the session: a
     #   thread from a previous (muted, replaced) account is dead and never
@@ -201,6 +234,14 @@ class Turn:
     user_mid: Optional[int] = None  # DeepSeek's id of the user message
     poisoned: bool = False     # the reply was a refusal (moderation's canned
     #   text or the model declining): nothing is continued from this state
+    reply_hash: str = ""       # hash of the whole reply (`reply_key`): when the
+    #   client's copy no longer matches, the user edited it ("" = not known
+    #   yet; filled from DeepSeek's history before the state is resumed)
+    carried_replies: Optional[List[str]] = None  # `reply_key` of each assistant
+    #   message sent INSIDE this turn's prompt, oldest first: for a root, the
+    #   greeting and history flattened into it; otherwise the replies resent
+    #   after a gap. A later change to one of them means DeepSeek saw a
+    #   different text. None = recorded before this existed (not checked).
 
     @property
     def session(self) -> str:
@@ -241,6 +282,8 @@ class Match:
     similarity: float = 0.0  # edits: how alike the new and old message are
     recovering: bool = False  # the state found was a refusal, so the turn is
     #   sent as an edit of the chat's first message instead
+    reply_edited: bool = False  # a later state was passed over because the
+    #   client edited the reply it produced: resending from before it
 
     @property
     def label(self) -> str:
@@ -268,6 +311,8 @@ class Match:
                 why.append(f"same question as message {self.regenerate_of} answered")
             elif self.kind == "edit":
                 why.append("changed question: new branch")
+        if self.reply_edited:
+            why.append("a later reply was edited in the client: resending from before it")
         if self.continues:
             why.append("continue the reply")
         if self.exhaustive:
@@ -287,6 +332,10 @@ def _alignable(history: History) -> List[int]:
 
 class TurnIndex:
     """The tree of turns we have answered, and how to find a history in it."""
+
+    # Set when a lookup passed over a state because the client edited a reply
+    # (per thread: lookups run concurrently on the server's worker threads).
+    _edit_seen = threading.local()
 
     def __init__(self, max_turns: int = 2048, path: Optional[str] = None) -> None:
         self._turns: "OrderedDict[str, Turn]" = OrderedDict()  # cid -> Turn, oldest first
@@ -370,11 +419,14 @@ class TurnIndex:
     def remember(self, history: History, conversation_id: str,
                  parent: Optional[str], reply_fp: str, reply_text: str,
                  account: str = "", user_mid: Optional[int] = None,
-                 poisoned: bool = False) -> None:
+                 poisoned: bool = False,
+                 carried_from: Optional[int] = None) -> None:
         """Record that `history` (a whole request) was answered from `parent`
         and left the thread at `conversation_id`, under `account`. `user_mid`
         is DeepSeek's id of the user message that carried the turn; `poisoned`
-        says the reply was a refusal, so the state must not be continued."""
+        says the reply was a refusal, so the state must not be continued.
+        `carried_from` is the index of the first history message sent in this
+        turn's prompt, when it resumed `parent` with more than the last one."""
         if not conversation_id or ":" not in conversation_id or not history:
             return
         role, text, _ = history[-1]
@@ -384,12 +436,26 @@ class TurnIndex:
             # tail of the alignable messages before it so that part of the
             # history can still be verified later (see `_verify`).
             prefix = [message_hash(history[i][1]) for i in _alignable(history)][-_PREFIX_CAP:]
+        elif carried_from is not None:
+            # Several messages went in one prompt: the turn stands for all of
+            # them, so the history between `parent` and this message can be
+            # walked through it next time.
+            prefix = [message_hash(history[i][1]) for i in _alignable(history)
+                      if i >= carried_from]
+        # The assistant messages that went to DeepSeek inside this prompt, as
+        # the client had them: if the client's copy changes later, DeepSeek's
+        # context no longer matches it.
+        start = 0 if parent is None else (carried_from if carried_from is not None
+                                          else len(history) - 1)
+        carried_replies = [reply_key(history[i][1]) for i in range(start, len(history) - 1)
+                           if history[i][0] == "assistant"]
         t = Turn(cid=conversation_id, parent=parent, role=role,
                  shape=message_shape(text), reply_fp=reply_fp,
                  reply_head=reply_head(reply_text), sys_head=system_head(history),
                  prefix=prefix, ts=time.time(), account=account,
                  text=gist(text) if role in _ALIGNABLE else "",
-                 user_mid=user_mid, poisoned=poisoned)
+                 user_mid=user_mid, poisoned=poisoned,
+                 reply_hash=reply_key(reply_text), carried_replies=carried_replies)
         with self._lock:
             # An account is replaced, never revisited (it was muted); its
             # threads are dead and only clutter the index.
@@ -436,7 +502,11 @@ class TurnIndex:
         sys_h = system_head(history)
         with self._lock:
             self._last_miss = ""
+            # A newer position whose every candidate fell over an edited reply
+            # (not merely another swipe the client did not keep).
+            edited = False
             for idx in range(len(positions) - 1, -1, -1):
+                TurnIndex._edit_seen.flag = False
                 j = positions[idx]
                 shape = message_shape(history[j][1])
                 cands = self._by_first.get(self._first(shape), ())
@@ -453,6 +523,11 @@ class TurnIndex:
                     has_reply = k < n - 1 and history[k][0] == "assistant"
                     if has_reply and history[k][2] != t.reply_fp:
                         continue   # a different branch: other tool calls
+                    if self._reply_changed(t, history, j):
+                        # The user rewrote this reply; DeepSeek's thread still
+                        # has the original. Look for an earlier state, so the
+                        # edited version is resent instead.
+                        continue
                     head = has_reply and reply_head(history[k][1]) == t.reply_head
                     # The reply sent LAST, with nothing after it, is a request
                     # to continue it ("continue" in SillyTavern and friends).
@@ -474,6 +549,8 @@ class TurnIndex:
                     rank = (depth, head or continues, sys_ok, t.ts)
                     if best is None or rank > best[0]:
                         best = (rank, m)
+                if not best and TurnIndex._edit_seen.flag:
+                    edited = True
                 if best:
                     self._turns.move_to_end(best[1].cid)
                     m = best[1]
@@ -486,8 +563,14 @@ class TurnIndex:
                                      depth=m.depth, sys=m.sys, head=m.head,
                                      exhaustive=m.exhaustive, sibling=True,
                                      kind="edit", recovering=True)
+                    m.reply_edited = edited
                     return self._classify(m, history)
             m = self._find_sibling(history, positions, sys_h, account)
+            if m is not None:
+                m.reply_edited = edited
+            elif edited and not self._last_miss:
+                self._last_miss = ("the first reply was edited in the client, so "
+                                   "no state of the thread matches it")
             if m is None and not self._last_miss:
                 self._last_miss = "no known turn in this history"
             return m
@@ -510,22 +593,27 @@ class TurnIndex:
         if m.continues:
             m.kind = "continue"
             return m
-        if m.resume_from != n - 1:
-            return m  # several messages are new: nothing to compare with
         role, text, _ = history[-1]
-        if role not in _ALIGNABLE or not text.strip():
+        if role not in _ALIGNABLE or not text.strip() or m.resume_from > n - 1:
             return m
+        # The messages sent in the same prompt before the last one (after an
+        # edited reply, say): a child that carried exactly these and the same
+        # last message is this very turn again.
+        carried = [message_hash(history[i][1]) for i in range(m.resume_from, n - 1)
+                   if history[i][0] in _ALIGNABLE and history[i][1].strip()]
         kids = [self._turns[c] for c in self._children.get(m.cid, ())
                 if self._turns[c].role == role]
         if not kids:
             return m
         shape = message_shape(text)
-        same = [k for k in kids if compatible(k.shape, shape)]
+        same = [k for k in kids if compatible(k.shape, shape) and k.prefix == carried]
         if same:
             k = max(same, key=lambda t: t.ts)
             if k.message_id is not None:
                 m.kind, m.regenerate_of = "regenerate", k.message_id
             return m
+        if m.resume_from != n - 1:
+            return m  # several messages are new: the next turn, not an edit
         m.kind = "edit"
         g = gist(text)
         m.similarity = max((similarity(g, k.text) for k in kids if k.text),
@@ -619,15 +707,40 @@ class TurnIndex:
         """
         depth = 1
         i = idx - 1
-        node = t
+        node, node_pos = t, positions[idx]
         while node.parent is not None and i >= 0:
+            # Messages this turn carried before its own: they sit between it
+            # and its parent in the history.
+            for h in reversed(node.prefix):
+                if i < 0:
+                    break
+                if message_hash(history[positions[i]][1]) != h:
+                    return None
+                depth += 1
+                i -= 1
+            if i < 0:
+                break
             parent = self._turns.get(node.parent)
             if parent is None:
                 return depth, False  # evicted: nothing more can be checked
-            if not compatible(parent.shape, message_shape(history[positions[i]][1])):
+            ppos = positions[i]
+            if not compatible(parent.shape, message_shape(history[ppos][1])):
+                return None
+            if self._reply_changed(parent, history, ppos):
+                return None  # an earlier reply was edited: not this state
+            # The replies this turn resent sit after the parent's own reply.
+            lo = ppos + 2 if (ppos + 1 < len(history)
+                              and history[ppos + 1][0] == "assistant") else ppos + 1
+            if not self._carried_ok(node, history, lo, node_pos):
                 return None
             depth += 1
-            node, i = parent, i - 1
+            node, node_pos, i = parent, ppos, i - 1
+        if i < 0 or node.parent is None:
+            # The history starts inside what this node's prompt carried (a
+            # root's flattened history, trimmed by the client's context
+            # window): what is left of it must still agree.
+            if not self._carried_ok(node, history, 0, node_pos, suffix=True):
+                return None
         if node.parent is None and i >= 0 and node.prefix:
             # The root was a flattened history; its remembered tail must match
             # the history before it, newest first.
@@ -640,6 +753,72 @@ class TurnIndex:
                 i -= 1
         exhaustive = node.parent is None and i < 0
         return depth, exhaustive
+
+    @staticmethod
+    def _carried_ok(t: Turn, history: History, lo: int, hi: int,
+                    suffix: bool = False) -> bool:
+        """Whether the assistant messages in history[lo:hi] are the ones `t`'s
+        prompt carried, as the client had them then. With `suffix`, the
+        history may have lost its oldest messages: what remains must be the
+        tail of what was carried."""
+        if t.carried_replies is None:
+            return True
+        got = [reply_key(history[x][1]) for x in range(max(lo, 0), hi)
+               if history[x][0] == "assistant"]
+        want = t.carried_replies
+        if suffix:
+            # Compare the overlap only: the client may have dropped the oldest
+            # messages, or kept a reply whose question it dropped.
+            k = min(len(got), len(want))
+            same = got[len(got) - k:] == want[len(want) - k:]
+        else:
+            same = got == want
+        if not same:
+            TurnIndex._edit_seen.flag = True
+        return same
+
+    # ---- records from before reply hashes ----------------------------------
+    def unhashed(self, cid: str) -> List[int]:
+        """DeepSeek message ids of the replies on the path to `cid` (the state
+        and its ancestors) that have no reply hash yet."""
+        out: List[int] = []
+        with self._lock:
+            node = self._turns.get(cid)
+            while node is not None:
+                if not node.reply_hash and node.message_id is not None:
+                    out.append(node.message_id)
+                node = self._turns.get(node.parent) if node.parent else None
+        return out
+
+    def fill_reply_hashes(self, session: str, replies: Dict[int, str]) -> int:
+        """Give every record of `session` that lacks one the hash of its
+        reply as DeepSeek stores it (`replies`: message id -> text). Returns
+        how many were filled."""
+        n = 0
+        with self._lock:
+            for t in self._turns.values():
+                if t.session != session or t.reply_hash:
+                    continue
+                if t.message_id in replies:
+                    t.reply_hash = reply_key(replies[t.message_id])
+                    n += 1
+                else:
+                    t.reply_hash = UNKNOWN_REPLY
+            self._save()
+        return n
+
+    @staticmethod
+    def _reply_changed(t: Turn, history: History, pos: int) -> bool:
+        """Whether the client's copy of `t`'s reply - the assistant message
+        right after the message at `pos` - is not the reply we sent."""
+        k = pos + 1
+        if t.reply_hash in ("", UNKNOWN_REPLY) or k >= len(history) \
+                or history[k][0] != "assistant":
+            return False
+        changed = reply_key(history[k][1]) != t.reply_hash
+        if changed:
+            TurnIndex._edit_seen.flag = True
+        return changed
 
     def __len__(self) -> int:
         with self._lock:

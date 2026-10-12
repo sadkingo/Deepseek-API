@@ -21,7 +21,7 @@ body to continue the same thread.
 
 import requests
 
-URL = "http://localhost:8000/v1/chat/completions"
+URL = "http://localhost:8010/v1/chat/completions"
 
 # Turn 1 — new conversation.
 first = requests.post(URL, json={

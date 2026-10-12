@@ -5,7 +5,7 @@
 You can use it in two ways:
 
 - 🐍 **As a Python library:** just call `client.chat("Hi")`. Supports streaming and multi-turn conversations.
-- 🔌 **As a local OpenAI-compatible API:** runs a server at `http://localhost:8000/v1` that speaks the OpenAI format, so the official `openai` SDK (and any OpenAI-compatible app) works as a drop-in, with `localhost` in place of OpenAI.
+- 🔌 **As a local OpenAI-compatible API:** runs a server at `http://localhost:8010/v1` that speaks the OpenAI format, so the official `openai` SDK (and any OpenAI-compatible app) works as a drop-in, with `localhost` in place of OpenAI.
 
 You sign in once in a browser with your DeepSeek account; your session is saved and refreshed automatically after that.
 
@@ -131,7 +131,7 @@ Start a local server that speaks the OpenAI API, so existing OpenAI tools and SD
 
 ```bash
 python app.py
-# -> DeepSeek OpenAI-compatible API on http://127.0.0.1:8000
+# -> DeepSeek OpenAI-compatible API on http://127.0.0.1:8010
 ```
 
 Then point any OpenAI client at it (the API key is required by the SDK but ignored):
@@ -139,7 +139,7 @@ Then point any OpenAI client at it (the API key is required by the SDK but ignor
 ```python
 from openai import OpenAI
 
-client = OpenAI(base_url="http://localhost:8000/v1", api_key="unused")
+client = OpenAI(base_url="http://localhost:8010/v1", api_key="unused")
 
 resp = client.chat.completions.create(
     model="deepseek-chat",
@@ -151,7 +151,7 @@ print(resp.choices[0].message.content)
 Or call it with plain HTTP / `curl`:
 
 ```bash
-curl http://localhost:8000/v1/chat/completions \
+curl http://localhost:8010/v1/chat/completions \
   -H "Content-Type: application/json" \
   -d '{"model": "deepseek-chat", "messages": [{"role": "user", "content": "Hello!"}]}'
 ```
@@ -380,7 +380,7 @@ and lets you attach images (`images`):
   "language_models": {
     "openai_compatible": {
       "DeepSeek Local": {
-        "api_url": "http://localhost:8000/v1",
+        "api_url": "http://localhost:8010/v1",
         "available_models": [
           {
             "name": "deepseek-chat",
@@ -699,6 +699,7 @@ recognised, explains a bad answer that the finished text alone does not.
 | --- | --- |
 | [deepseek/](deepseek/) | The core library: `DeepSeekClient`, auth/browser sign-in ([auth.py](deepseek/auth.py)), the HTTP driver ([client.py](deepseek/client.py)), and the PoW solver ([pow.py](deepseek/pow.py)) |
 | [server/](server/) | The FastAPI OpenAI-compatible server |
+| [extension/](extension/) | Chrome extension that registers a fresh DeepSeek account inside your own Chrome when the server asks ([extension/README.md](extension/README.md)) |
 | [examples/](examples/) | Runnable examples for every feature ([examples/README.md](examples/README.md)) |
 | [app.py](app.py) | Starts the server |
 

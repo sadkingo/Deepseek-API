@@ -285,7 +285,7 @@ Support an upstream HTTP or SOCKS5 residential proxy in `.env`:
 # .env configuration
 UPSTREAM_PROXY=socks5://127.0.0.1:1080
 # Or residential proxy:
-# UPSTREAM_PROXY=http://user:password@residential-node.example.com:8000
+# UPSTREAM_PROXY=http://user:password@residential-node.example.com:8010
 ```
 
 Load this in `deepseek/client.py`:

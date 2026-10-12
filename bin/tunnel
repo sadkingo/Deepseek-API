@@ -7,7 +7,10 @@
 set -euo pipefail
 
 CLOUDFLARED="${CLOUDFLARED:-$HOME/cloudflared}"
-PORT="${PORT:-8000}"
+# Same port the server uses: PORT from the environment, else from .env, else 8010.
+ENV_FILE="$(dirname "$(readlink -f "$0")")/../.env"
+PORT="${PORT:-$(grep -E '^PORT=' "$ENV_FILE" 2>/dev/null | tail -1 | cut -d= -f2)}"
+PORT="${PORT:-8010}"
 
 if [ ! -x "$CLOUDFLARED" ]; then
     echo "cloudflared not found at $CLOUDFLARED" >&2

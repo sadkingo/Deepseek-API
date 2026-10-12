@@ -1,7 +1,7 @@
 import unittest
 
 from deepseek.client import (COMPLETION_PATH, REGENERATE_PATH, EditRateLimited,
-                             _EditQuota, _Stream)
+                             UpstreamGaveUp, _EditQuota, _Stream)
 
 
 class FakeClient:
@@ -93,6 +93,50 @@ class RegenerateFallback(unittest.TestCase):
         self.assertEqual([p for p, _ in self.calls], [REGENERATE_PATH])
 
 
+class RegenerationLimit(unittest.TestCase):
+    """DeepSeek caps how often ONE message is regenerated ("Regeneration limit
+    reached" after six). The swipe then edits the message - same text plus a
+    space - which is a new branch with its own allowance."""
+
+    def setUp(self):
+        self.client = FakeClient()
+        self.calls = []
+
+    def request(self, path, body, meta):
+        self.calls.append((path, dict(body)))
+        if path == REGENERATE_PATH:
+            raise UpstreamGaveUp(
+                "DeepSeek gave up on the request (regeneration_limit): "
+                "Regeneration limit reached",
+                reason="regeneration_limit", content="Regeneration limit reached")
+        meta["message_id"] = 28
+        yield ("text", "a fresh reply")
+
+    def test_the_limit_becomes_an_edit_with_a_space_added(self):
+        s = stream_with(self.client, regenerate_of=24, parent_id=11,
+                        prompt="sadking: *few days after*")
+        s._request = self.request
+        with self.assertLogs("deepseek.upstream", level="WARNING") as logs:
+            self.assertEqual(list(s._attempt({})), [("text", "a fresh reply")])
+        self.assertEqual([p for p, _ in self.calls], [REGENERATE_PATH, COMPLETION_PATH])
+        edit = self.calls[1][1]
+        self.assertEqual(edit["parent_message_id"], 11)       # same state as the swipe
+        self.assertEqual(edit["prompt"], "sadking: *few days after* ")
+        self.assertEqual(self.client.sessions_created, 0)     # same chat
+        # Only this message is capped; the account's quota is untouched.
+        self.assertFalse(self.client._edit_quota.spent())
+        self.assertIn("regeneration limit", logs.output[0])
+
+    def test_other_give_ups_still_fail(self):
+        def request(path, body, meta):
+            raise UpstreamGaveUp("busy", reason="generation_timeout", content="Server busy")
+            yield
+        s = stream_with(self.client, regenerate_of=24)
+        s._request = request
+        with self.assertRaises(UpstreamGaveUp):
+            list(s._attempt({}))
+
+
 class Cooldown(unittest.TestCase):
     def test_note_and_clear(self):
         q = _EditQuota()
@@ -112,3 +156,21 @@ class Cooldown(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class ReplyTexts(unittest.TestCase):
+    def test_only_response_fragments_of_assistant_messages(self):
+        from deepseek.client import DeepSeekClient
+        client = DeepSeekClient.__new__(DeepSeekClient)   # no session needed
+        client._simulate_thread_navigation = lambda sid: [
+            {"message_id": 1, "role": "USER",
+             "fragments": [{"type": "REQUEST", "content": "hi"}]},
+            {"message_id": 2, "role": "ASSISTANT",
+             "fragments": [{"type": "THINK", "content": "hmm"},
+                           {"type": "RESPONSE", "content": "Hello "},
+                           {"type": "RESPONSE", "content": "there."},
+                           {"type": "TIP", "content": "AI-generated"}]},
+        ]
+        self.assertEqual(client.reply_texts("s"), {2: "Hello there."})
+        client._simulate_thread_navigation = lambda sid: None
+        self.assertIsNone(client.reply_texts("s"))

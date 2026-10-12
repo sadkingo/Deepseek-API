@@ -1,6 +1,6 @@
 """Entry point — run the OpenAI-compatible DeepSeek server.
 
-    python app.py            # serves on http://localhost:8000
+    python app.py            # serves on http://localhost:8010
 
 On first use (no saved session) a browser window opens for you to sign in by
 hand; run `python -m deepseek.auth` to do that ahead of time. Set
@@ -9,7 +9,6 @@ DEEPSEEK_PROFILE_DIR to reuse an existing signed-in Chrome profile.
 
 import os
 
-import uvicorn
 from dotenv import load_dotenv
 
 load_dotenv()
@@ -23,17 +22,16 @@ if __name__ == "__main__":
         except Exception as e:
             print(f"[warning] Could not start WAF sidecar: {e}")
 
-    # Serve HTTPS when a cert pair is configured. A browser page loaded over
-    # https:// cannot call an http:// API (mixed content), so an internet-facing
-    # deployment needs TLS either here or behind a reverse proxy.
-    ssl_certfile = os.getenv("SSL_CERTFILE") or None
-    ssl_keyfile = os.getenv("SSL_KEYFILE") or None
+    # Serve HTTPS when a cert pair is configured (./setup-https.sh gets one).
+    # A browser page loaded over https:// cannot call an http:// API (mixed
+    # content), so an internet-facing deployment needs TLS. This machine's own
+    # tools keep plain HTTP on 127.0.0.1 at the same port; see server/listen.py.
+    from server.listen import run
 
-    uvicorn.run(
+    run(
         "server.api:app",
         host=os.getenv("HOST", "127.0.0.1"),
-        port=int(os.getenv("PORT", "8000")),
-        reload=False,
-        ssl_certfile=ssl_certfile,
-        ssl_keyfile=ssl_keyfile,
+        port=int(os.getenv("PORT", "8010")),
+        certfile=os.getenv("SSL_CERTFILE") or None,
+        keyfile=os.getenv("SSL_KEYFILE") or None,
     )

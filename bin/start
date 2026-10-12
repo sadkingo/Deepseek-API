@@ -19,7 +19,7 @@ if [ ! -x venv/bin/python ]; then
 fi
 
 PORT="${PORT:-$(grep -E '^PORT=' .env 2>/dev/null | tail -1 | cut -d= -f2)}"
-PORT="${PORT:-8000}"
+PORT="${PORT:-8010}"
 
 # Anything of ours already on that port? Match our own app.py processes only,
 # so an unrelated program using the port is reported rather than killed.
@@ -42,10 +42,12 @@ fi
 
 # --- muted-account auto-recovery -------------------------------------------
 # DeepSeek muting an account is permanent; the only fix is a fresh account.
-# When the server sees "user is muted" from upstream it drops this flag file
-# and exits (see server/api.py). The loop below then runs the global sign-up
-# automation to register a fresh account (which writes session/session.json)
-# and starts the server again — fully automatic, in this same terminal.
+# The server first tries to recover in place through the Chrome extension
+# (see server/api.py); only if that fails, or with MUTED_RECOVERY=restart, it
+# drops this flag file and exits. The loop below then runs the previous
+# sign-up automation (`register-old`, a Chrome launched by the script) to
+# register a fresh account (which writes session/session.json) and starts the
+# server again — fully automatic, in this same terminal.
 MUTED_FLAG=logs/.account-muted
 STAMP=logs/.recover-stamp
 REGISTER="${REGISTER_CMD:-$HOME/Desktop/Create account deepseek/bin/register}"

@@ -1,10 +1,10 @@
 """
 OpenAI-compatible FastAPI server for DeepSeek.
 
-Point any OpenAI client at http://localhost:8000/v1 :
+Point any OpenAI client at http://localhost:8010/v1 :
 
     from openai import OpenAI
-    client = OpenAI(base_url="http://localhost:8000/v1", api_key="not-needed")
+    client = OpenAI(base_url="http://localhost:8010/v1", api_key="not-needed")
     r = client.chat.completions.create(
         model="deepseek-chat",
         messages=[{"role": "user", "content": "Hello!"}],
@@ -39,7 +39,8 @@ from starlette.concurrency import run_in_threadpool
 from starlette.requests import Request
 
 from . import debuglog
-from deepseek.auth import LoginRequired, relogin
+from . import register as account_register
+from deepseek.auth import LoginRequired, Session, relogin
 from deepseek.client import (DeepSeekClient, EditRateLimited, PoisonedThread,
                              RateLimited, ServerBusy, UpstreamGaveUp)
 
@@ -174,6 +175,21 @@ def get_client(force_refresh: bool = False) -> DeepSeekClient:
                 _client = DeepSeekClient(allow_interactive=SERVER_INTERACTIVE_LOGIN,
                                          force_refresh=force_refresh)
     return _client
+
+
+def _install_session(session: Session) -> None:
+    """Switch the running server to a session captured by the Chrome extension
+    (see server/register.py) without a restart: a fresh client around the new
+    account, in place of whichever one was serving."""
+    global _client
+    fresh = DeepSeekClient(session=session, allow_interactive=SERVER_INTERACTIVE_LOGIN)
+    with _client_lock:
+        _client = fresh
+    debuglog.log_error("switched to a freshly registered account")
+
+
+account_register.session_installed = _install_session
+app.include_router(account_register.router)
 
 
 # DeepSeek invalidates tokens — the web app signed out, the account signed in
@@ -427,15 +443,68 @@ class _RefusalGuard:
 # on the new session. Fired at most once per server lifetime, and bin/start
 # additionally refuses to recover twice within 10 minutes, so a muted-again
 # replacement account can't spiral into endless registrations.
+#
+# MUTED_RECOVERY=extension (the default) does it without going down: the
+# server queues a sign-up job for the Chrome extension (server/register.py),
+# starts Chrome if the extension is not polling, and switches to the new
+# account when the session arrives. Only if that fails does it fall back to
+# the flag-and-exit path above. MUTED_RECOVERY=restart skips the extension.
 _MUTED_FLAG = Path(__file__).resolve().parents[1] / "logs" / ".account-muted"
 _recover_launched = False
 _recover_lock = threading.Lock()
+MUTED_RECOVERY = os.getenv("MUTED_RECOVERY", "extension").strip().lower()
+RECOVER_SPACING = 600.0   # never register twice within this, as bin/start
+_recover_last_at = 0.0
+_recover_in_progress = False
+
+
+def _recover_via_extension() -> None:
+    global _recover_last_at, _recover_in_progress
+    with _recover_lock:
+        if _recover_in_progress:
+            return
+        if time.time() - _recover_last_at < RECOVER_SPACING:
+            debuglog.log_error("account muted again within 10 minutes of the last "
+                               "recovery — not registering another one")
+            return
+        _recover_last_at = time.time()
+        _recover_in_progress = True
+    debuglog.log_error("account muted — registering a fresh one through the "
+                       "Chrome extension")
+
+    def _run():
+        global _recover_in_progress
+        try:
+            job = account_register.broker.request(reason="account muted")
+            debuglog.log_error(f"register job {job.id} queued")
+            account_register.ensure_extension(
+                account_register.broker, say=debuglog.log_error)
+            timeout = account_register.CODE_WAIT_SECONDS + 600
+            account_register.broker.wait_done(job, timeout)
+            if job.state == "done":
+                return  # the session was installed by _install_session
+            debuglog.log_error(f"extension recovery failed: {job.error or job.state}")
+        except Exception as e:
+            debuglog.log_error(f"extension recovery failed: {e}")
+        finally:
+            with _recover_lock:
+                _recover_in_progress = False
+        _recover_by_restart()
+
+    threading.Thread(target=_run, name="muted-register", daemon=True).start()
 
 
 def _maybe_recover_muted(message: str) -> None:
-    global _recover_launched
     if "user is muted" not in message.lower():
         return
+    if MUTED_RECOVERY == "extension":
+        _recover_via_extension()
+    else:
+        _recover_by_restart()
+
+
+def _recover_by_restart() -> None:
+    global _recover_launched
     with _recover_lock:
         if _recover_launched:
             return
@@ -592,6 +661,21 @@ async def chat_completions(req: ChatCompletionRequest, request: Request):
     match = None
     if conversation_id is None:
         match = _threads.find(history, account)
+        if match and not match.sibling and ":" in match.cid:
+            # States recorded before whole replies were hashed cannot tell an
+            # edited reply from a kept one. Fill them in from DeepSeek's own
+            # copy of the chat (one read, once per chat), then look again: an
+            # edit the client made to one of those replies now counts.
+            missing = _threads.unhashed(match.cid)
+            if missing:
+                session = _session_of(match.cid)
+                replies = await run_in_threadpool(client.reply_texts, session)
+                if replies is not None:
+                    filled = _threads.fill_reply_hashes(session, replies)
+                    debuglog.log_thread(
+                        f"filled in {filled} older repl{'y' if filled == 1 else 'ies'} "
+                        f"of chat {session} from DeepSeek, to check them for edits")
+                    match = _threads.find(history, account)
         if match:
             conversation_id, resume_from = match.cid, match.resume_from
             debuglog.log_thread(
@@ -741,9 +825,12 @@ async def chat_completions(req: ChatCompletionRequest, request: Request):
                 debuglog.log_thread(
                     f"state {cid} is a refusal; the next turn on it will edit "
                     "the chat's first message instead")
+            # Resumed with more than the newest message (after an edited
+            # reply, or a gap): the turn stands for all of them.
+            carried = resume_from if (parent and resume_from < len(history) - 1) else None
             _threads.remember(history, cid, parent, fingerprint, reply_text,
                               account=account, user_mid=user_mid,
-                              poisoned=poisoned)
+                              poisoned=poisoned, carried_from=carried)
             if tools_fp:
                 # This thread has now seen these tools; later turns need not
                 # repeat the preamble unless the set changes again.

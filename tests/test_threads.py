@@ -159,3 +159,181 @@ class RefusedStates(unittest.TestCase):
         m = idx.find(h2, "acct")
         self.assertFalse(m.recovering)
         self.assertEqual((m.cid, m.kind, m.regenerate_of), ("sess:2", "regenerate", 4))
+
+
+class EditedReplies(unittest.TestCase):
+    """The user rewrites a reply in the frontend, then goes on. DeepSeek's thread
+    still holds the reply as generated, so the turn is picked up from before it
+    and the edited reply is resent (the case behind this: JanitorAI sent back a
+    1,878-character reply that DeepSeek had generated as 2,917 characters, with
+    the same opening, and the old code resumed after it as if nothing changed)."""
+
+    HEADER = "`Time: 19:26 | October 16, Friday | Location: Rossi's Trattoria`"
+    R2 = HEADER + "\n\n*She stayed.* " + "The evening went on and on. " * 40
+    R2_EDITED = HEADER + "\n\n*She left before dessert.*"
+
+    def setUp(self):
+        self.idx = TurnIndex(path=None)
+        self.h1 = hist(("user", "sadking: few days after, a date" + NOTE))
+        self.idx.remember(self.h1, "sess:2", None, "", "Jillian walks in.", "acct")
+        self.h2 = hist(("user", "sadking: few days after, a date"),
+                       ("assistant", "Jillian walks in."),
+                       ("user", "sadking: you see where you stand?" + NOTE))
+        self.idx.remember(self.h2, "sess:4", "sess:2", "", self.R2, "acct")
+
+    def after_edit(self, last):
+        return hist(("user", "sadking: few days after, a date"),
+                    ("assistant", "Jillian walks in."),
+                    ("user", "sadking: you see where you stand?"),
+                    ("assistant", self.R2_EDITED),
+                    ("user", last))
+
+    def test_an_edited_reply_is_not_continued(self):
+        # Same opening, so the old 160-character check called it kept.
+        self.assertEqual(self.R2[:60], self.R2_EDITED[:60])
+        h = self.after_edit("sadking: move on" + NOTE)
+        m = self.idx.find(h, "acct")
+        # The state before the edited turn; the question, the edited reply and
+        # the new message are all resent from there.
+        self.assertEqual((m.cid, m.kind), ("sess:2", "append"))
+        self.assertEqual(m.resume_from, 5)  # the question the edited reply answered
+        self.assertTrue(m.reply_edited)
+        self.assertIn("edited in the client", m.describe())
+
+    def test_the_unedited_reply_still_resumes_as_before(self):
+        h = hist(("user", "sadking: few days after, a date"),
+                 ("assistant", "Jillian walks in."),
+                 ("user", "sadking: you see where you stand?"),
+                 ("assistant", "  " + self.R2.replace(" ", "  ") + "\n"),  # whitespace only
+                 ("user", "sadking: move on" + NOTE))
+        m = self.idx.find(h, "acct")
+        self.assertEqual((m.cid, m.resume_from, m.reply_edited), ("sess:4", len(h) - 1, False))
+
+    def test_a_changed_header_alone_is_an_edit(self):
+        h = self.after_edit("sadking: move on" + NOTE)
+        h[6] = ("assistant", self.R2.replace("19:26", "21:00"), "")
+        self.assertEqual(self.idx.find(h, "acct").cid, "sess:2")
+
+    def test_after_the_resend_the_chat_carries_on_normally(self):
+        h3 = self.after_edit("sadking: move on" + NOTE)
+        m = self.idx.find(h3, "acct")
+        self.idx.remember(h3, "sess:6", m.cid, "", "Jillian goes quiet.", "acct",
+                          carried_from=m.resume_from)
+        # Next turn: only the newest message is new.
+        h4 = self.after_edit("sadking: move on") + [
+            ("assistant", "Jillian goes quiet.", ""),
+            ("user", "sadking: bye" + NOTE, "")]
+        m4 = self.idx.find(h4, "acct")
+        self.assertEqual((m4.cid, m4.kind, m4.resume_from), ("sess:6", "append", len(h4) - 1))
+        self.assertFalse(m4.reply_edited)
+        # A swipe on the resent turn is DeepSeek's Regenerate of its answer.
+        again = self.idx.find(h3, "acct")
+        self.assertEqual((again.cid, again.kind, again.regenerate_of),
+                         ("sess:2", "regenerate", 6))
+
+    def test_an_edited_older_reply_is_caught_too(self):
+        h = hist(("user", "sadking: few days after, a date"),
+                 ("assistant", "Jillian walks in, soaked."),   # edited
+                 ("user", "sadking: you see where you stand?"),
+                 ("assistant", self.R2),
+                 ("user", "sadking: move on" + NOTE))
+        # Both states sit after the edited first reply: nothing can be resumed,
+        # so the history goes out whole.
+        self.assertIsNone(self.idx.find(h, "acct"))
+        self.assertIn("edited", self.idx.last_miss())
+
+    def test_records_from_before_reply_hashes_are_never_edited(self):
+        self.idx._turns["sess:4"].reply_hash = ""
+        h = self.after_edit("sadking: move on" + NOTE)
+        self.assertEqual(self.idx.find(h, "acct").cid, "sess:4")
+
+
+class EveryReplyIsChecked(unittest.TestCase):
+    """Edits are caught wherever the text went to DeepSeek: as our reply, inside
+    a chat's first prompt (the greeting), or resent after an earlier edit - and
+    for records made before reply hashes existed, once they are filled in from
+    DeepSeek's copy of the chat."""
+
+    def build(self, legacy=False):
+        idx = TurnIndex(path=None)
+        h1 = hist(("user", "sadking: hi" + NOTE))
+        idx.remember(h1, "sess:2", None, "", "Jillian waves.", "acct")
+        h2 = hist(("user", "sadking: hi"), ("assistant", "Jillian waves."),
+                  ("user", "sadking: date?" + NOTE))
+        idx.remember(h2, "sess:4", "sess:2", "", "She says yes, then leaves.", "acct")
+        h3 = hist(("user", "sadking: hi"), ("assistant", "Jillian waves."),
+                  ("user", "sadking: date?"), ("assistant", "She says yes, then leaves."),
+                  ("user", "sadking: cheater" + NOTE))
+        idx.remember(h3, "sess:6", "sess:4", "", "Jillian flinches.", "acct")
+        if legacy:  # as recorded before this existed
+            for t in idx._turns.values():
+                t.reply_hash, t.carried_replies = "", None
+        return idx
+
+    def edited_history(self):
+        return hist(("user", "sadking: hi"), ("assistant", "Jillian waves."),
+                    ("user", "sadking: date?"), ("assistant", "She says yes."),  # edited
+                    ("user", "sadking: cheater"), ("assistant", "Jillian flinches."),
+                    ("user", "sadking: bye" + NOTE))
+
+    def test_old_records_are_checked_once_filled_in_from_deepseek(self):
+        idx = self.build(legacy=True)
+        h = self.edited_history()
+        # Without the reply text the edit is invisible: the newest state wins.
+        self.assertEqual(idx.find(h, "acct").cid, "sess:6")
+        self.assertEqual(sorted(idx.unhashed("sess:6")), [2, 4, 6])
+        filled = idx.fill_reply_hashes("sess", {2: "Jillian waves.",
+                                               4: "She says yes, then leaves.",
+                                               6: "Jillian flinches."})
+        self.assertEqual(filled, 3)
+        self.assertEqual(idx.unhashed("sess:6"), [])
+        m = idx.find(h, "acct")
+        self.assertEqual((m.cid, m.resume_from, m.reply_edited), ("sess:2", 5, True))
+
+    def test_a_reply_deepseek_no_longer_has_is_asked_for_once(self):
+        idx = self.build(legacy=True)
+        idx.fill_reply_hashes("sess", {2: "Jillian waves."})
+        self.assertEqual(idx.unhashed("sess:6"), [])           # not fetched again
+        self.assertEqual(idx.find(self.edited_history(), "acct").cid, "sess:6")
+
+    def test_an_edited_greeting_means_the_chat_cannot_be_resumed(self):
+        idx = self.build()
+        h = self.edited_history()
+        h[2] = ("assistant", "*Jillian looks up.* You're early.", "")  # the greeting
+        self.assertIsNone(idx.find(h, "acct"))
+        self.assertIn("edited", idx.last_miss())
+
+    def test_a_resent_reply_edited_again_is_caught(self):
+        idx = self.build()
+        h = self.edited_history()
+        m = idx.find(h, "acct")
+        idx.remember(h, "sess:8", m.cid, "", "Jillian walks out.", "acct",
+                     carried_from=m.resume_from)
+        h2 = list(h[:-1]) + [("user", "sadking: bye", ""),
+                             ("assistant", "Jillian walks out.", ""),
+                             ("user", "sadking: wait" + NOTE, "")]
+        self.assertEqual(idx.find(h2, "acct").cid, "sess:8")    # carried as sent
+        h2[6] = ("assistant", "She says no.", "")               # edited once more
+        m2 = idx.find(h2, "acct")
+        self.assertEqual((m2.cid, m2.reply_edited), ("sess:2", True))
+
+    def test_a_trimmed_history_is_not_an_edit(self):
+        idx = self.build()
+        h = hist(("user", "sadking: hi"), ("assistant", "Jillian waves."),
+                 ("user", "sadking: date?"), ("assistant", "She says yes, then leaves."),
+                 ("user", "sadking: cheater"), ("assistant", "Jillian flinches."),
+                 ("user", "sadking: bye" + NOTE))
+        trimmed = [h[0]] + h[4:]   # the context window dropped the oldest turns
+        m = idx.find(trimmed, "acct")
+        self.assertEqual((m.cid, m.reply_edited), ("sess:6", False))
+
+    def test_keeping_one_swipe_is_not_an_edit(self):
+        idx = self.build()
+        h2 = hist(("user", "sadking: hi"), ("assistant", "Jillian waves."),
+                  ("user", "sadking: date?" + NOTE))
+        idx.remember(h2, "sess:5", "sess:2", "", "She says no.", "acct")  # a swipe
+        h = hist(("user", "sadking: hi"), ("assistant", "Jillian waves."),
+                 ("user", "sadking: date?"), ("assistant", "She says no."),
+                 ("user", "sadking: why" + NOTE))
+        m = idx.find(h, "acct")
+        self.assertEqual((m.cid, m.reply_edited), ("sess:5", False))

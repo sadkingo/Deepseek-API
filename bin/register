@@ -1,0 +1,28 @@
+#!/usr/bin/env bash
+# Register a fresh DeepSeek account through the Chrome extension.
+#
+# Queues a sign-up job (server/register.py) and follows it until the extension
+# in your Chrome has created the account and handed the session over. With the
+# server running it switches to the new account on the spot; with no server
+# running this script hosts the /register routes itself for the one job and
+# saves session/session.json for the server to load when it starts. Exit 0
+# when a session was saved, 1 otherwise.
+#
+# Needs: Chrome open with extension/ loaded and pointed at this address, and
+# the sign-up credentials in the sign-up project's .env (DEEPSEEK_EMAIL,
+# DEEPSEEK_PASSWORD, GMAIL_APP_PASSWORD).
+#
+#   bin/register              # queue and follow
+#   bin/register --no-wait    # just queue
+#   bin/register --server http://127.0.0.1:8001
+set -euo pipefail
+
+cd "$(dirname "$(readlink -f "$0")")/.."
+
+if [ ! -x venv/bin/python ]; then
+    echo "No virtualenv at $(pwd)/venv — create it first:" >&2
+    echo "  python3 -m venv venv && venv/bin/pip install -r requirements.txt" >&2
+    exit 1
+fi
+
+exec venv/bin/python -m server.register "$@"
