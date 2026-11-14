@@ -260,7 +260,7 @@ function baseDomain(url) {
   return host.split('.').slice(-2).join('.');
 }
 
-async function openWorkWindow(s) {
+async function openWorkTab(s) {
   // The sign-up runs in the normal profile: the browser DeepSeek already
   // knows, with its history and its device identity. A new account must not
   // inherit the previous one's login, cookies or storage, so DeepSeek's site
@@ -277,6 +277,18 @@ async function openWorkWindow(s) {
       serviceWorkers: true, fileSystems: true, webSQL: true, cache: true,
     });
   }
+  // A new tab in the window you are using. It is made active because a
+  // background tab gets its timers throttled and the page can tell it is hidden.
+  if (!incognito) {
+    const wins = await chrome.windows.getAll({ windowTypes: ['normal'] });
+    const own = wins.filter((w) => !w.incognito);
+    const current = own.find((w) => w.focused) || own[0];
+    if (current) {
+      const tab = await chrome.tabs.create({ windowId: current.id, url: 'about:blank', active: true });
+      return { win: null, tab, incognito };
+    }
+  }
+  // Incognito needs a window of its own, as does a browser with no window open.
   const win = await chrome.windows.create({
     url: 'about:blank', incognito, focused: false, width: 1200, height: 900, type: 'normal',
   });
@@ -390,10 +402,10 @@ async function runJob(job, s) {
   // now and then keeps this one alive for the minutes a sign-up takes.
   const keepAlive = setInterval(() => chrome.runtime.getPlatformInfo(), 20000);
 
-  const { win, tab, incognito } = await openWorkWindow(s);
+  const { win, tab, incognito } = await openWorkTab(s);
   const driver = new Driver(tab.id, s.trustedInput);
   try {
-    await api.progress('window', `window opened (${incognito ? 'incognito' : 'site data cleared'}, `
+    await api.progress('window', `${win ? 'window' : 'tab'} opened (${incognito ? 'incognito' : 'site data cleared'}, `
       + `${s.trustedInput ? 'trusted' : 'synthetic'} input)`);
     await openSignupPage(driver, api, s);
 
@@ -434,7 +446,10 @@ async function runJob(job, s) {
   } finally {
     clearInterval(keepAlive);
     await driver.close();
-    try { await chrome.windows.remove(win.id); } catch (_) { /* already closed */ }
+    try {
+      if (win) await chrome.windows.remove(win.id);
+      else await chrome.tabs.remove(tab.id);
+    } catch (_) { /* already closed */ }
   }
 }
 

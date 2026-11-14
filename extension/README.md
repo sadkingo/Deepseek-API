@@ -23,7 +23,7 @@ bin/register ──POST /register──▶ server ◀──long-poll── exten
 2. The server resolves the next free `+N` Gmail alias (as `register.py` does)
    and holds the job. The extension polls every 30 s and picks it up.
 3. The extension clears DeepSeek's site data in your profile (so the old
-   login cannot get in the way), opens a normal window, goes to the sign-in
+   login cannot get in the way), opens a new tab in your current window, goes to the sign-in
    page, follows
    **Sign up**, types the email and password, and clicks **Send code**. On
    "Current device environment error" or "Registration failed. Please try
@@ -91,7 +91,7 @@ exit-and-restart recovery in `bin/start`. Details in
 | --- | --- |
 | Server | The Deepseek-API server to poll (default `http://127.0.0.1:8010`). |
 | Register token | Sent as `X-Register-Token`; only needed with `REGISTER_TOKEN`. |
-| Use an incognito window | Off by default: the sign-up runs in your normal profile, the browser DeepSeek already knows, after clearing DeepSeek's site data there (you get signed out of chat.deepseek.com in that profile; the API uses the new account anyway). On: a throwaway incognito window, which needs **Allow in Incognito** on the extension's page. |
+| Use an incognito window | Off by default: the sign-up runs in a new tab of your current window, in the profile DeepSeek already knows, after clearing DeepSeek's site data there (you get signed out of chat.deepseek.com in that profile; the API uses the new account anyway). On: a throwaway incognito window, which needs **Allow in Incognito** on the extension's page. |
 | Trusted input | Type and click through the DevTools protocol (`chrome.debugger`), so the page sees real, trusted input events exactly as `register.py` sends them. Asks for the optional `debugger` permission and shows Chrome's "started debugging this browser" bar during a sign-up. Off by default: the page then gets synthetic pointer, keyboard and input events, which React forms accept. Turn it on if DeepSeek keeps answering with the device error. |
 
 `chrome.storage.local` also honours `signinUrl`, `signupUrl` and `chatUrl`,

@@ -260,6 +260,7 @@ class ExtensionEndToEnd(unittest.TestCase):
         log = "\n".join(f"{e['stage']}: {e['message']}" for e in status["log"])
         self.assertEqual(status["state"], "done", log)
         self.assertIn("trusted input" if trusted else "synthetic input", log)
+        self.assertIn("tab opened", log)  # a tab in the open window, not a new window
 
         # Three sends: device error, then B11, then it went through.
         self.assertEqual(len(MOCK_STATE["sends"]), 3, MOCK_STATE)

@@ -39,13 +39,13 @@ function fmtAgo(ts) {
 async function refresh() {
   const allowed = await chrome.extension.isAllowedIncognitoAccess();
   if (!$('incognito').checked) {
-    $('incognito-line').innerHTML = 'Window: <span class="ok">normal profile</span> — DeepSeek site data '
+    $('incognito-line').innerHTML = 'Window: <span class="ok">new tab in the current window</span> — DeepSeek site data '
       + 'in this profile is cleared before each sign-up (you get signed out of chat.deepseek.com).';
   } else if (allowed) {
     $('incognito-line').innerHTML = 'Window: <span class="ok">incognito</span> — each sign-up runs in a fresh incognito window.';
   } else {
-    $('incognito-line').innerHTML = 'Window: <span class="warn">incognito not allowed</span> — a normal window '
-      + 'will be used. <a id="ext-page">Allow in Incognito</a> on the extension page.';
+    $('incognito-line').innerHTML = 'Window: <span class="warn">incognito not allowed</span> — a new tab '
+      + 'in the current window will be used. <a id="ext-page">Allow in Incognito</a> on the extension page.';
   }
   const link = $('ext-page');
   if (link) link.onclick = () => chrome.tabs.create({ url: `chrome://extensions/?id=${chrome.runtime.id}` });
