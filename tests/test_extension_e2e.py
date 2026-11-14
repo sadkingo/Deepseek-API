@@ -219,7 +219,7 @@ class ExtensionEndToEnd(unittest.TestCase):
                 manifest["optional_permissions"] = []
                 (ext_dir / "manifest.json").write_text(json.dumps(manifest))
             context = pw.chromium.launch_persistent_context(
-                profile, channel="chromium", headless=True,
+                profile, **({"executable_path": os.environ["E2E_BROWSER"], "headless": False} if os.getenv("E2E_BROWSER") else {"channel": "chromium", "headless": True}),
                 args=[f"--disable-extensions-except={ext_dir}",
                       f"--load-extension={ext_dir}"])
             try:

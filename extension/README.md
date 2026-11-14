@@ -102,6 +102,8 @@ which the end-to-end test uses to point the extension at a mock site.
 ```bash
 venv/bin/python -m unittest tests.test_register                        # the server side
 RUN_EXTENSION_E2E=1 venv/bin/python -m unittest tests.test_extension_e2e  # the extension in Chromium, ~30 s
+E2E_BROWSER=/usr/lib/x86_64-linux-gnu/opera-gx-stable/opera RUN_EXTENSION_E2E=1 \
+  venv/bin/python -m unittest tests.test_extension_e2e                     # same, in a real browser such as Opera GX
 ```
 
 The end-to-end test loads this folder into Playwright's Chromium, serves a

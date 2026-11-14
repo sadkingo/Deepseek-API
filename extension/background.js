@@ -280,8 +280,10 @@ async function openWorkWindow(s) {
   const win = await chrome.windows.create({
     url: 'about:blank', incognito, focused: false, width: 1200, height: 900, type: 'normal',
   });
-  const tab = win.tabs && win.tabs[0] ? win.tabs[0]
-    : (await chrome.tabs.query({ windowId: win.id }))[0];
+  // Opera GX puts its own pinned, unmodifiable GX Corner tab first in every
+  // new window, so take the about:blank tab asked for, not tabs[0].
+  const tabs = await chrome.tabs.query({ windowId: win.id });
+  const tab = tabs.find((t) => (t.pendingUrl || t.url) === 'about:blank') || tabs[tabs.length - 1];
   return { win, tab, incognito };
 }
 
