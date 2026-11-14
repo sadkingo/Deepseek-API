@@ -129,3 +129,42 @@ class EditQuotaTests(unittest.TestCase):
         with self.assertRaises(UpstreamGaveUp) as ctx:
             list(_parse_sse(self._hint("generation_timeout"), {}))
         self.assertNotIsInstance(ctx.exception, EditRateLimited)
+
+
+class ResentResponseTests(unittest.TestCase):
+    """DeepSeek can describe the response again mid-stream: a fresh snapshot
+    followed by the deltas replayed, or the fragment list SET whole. The text
+    already sent must not go out a second time."""
+
+    def _text(self, lines):
+        return "".join(c for k, c in _parse_sse(_stream(*lines), {}) if k == "text")
+
+    def test_replayed_stream_is_not_sent_twice(self):
+        head = [
+            'data: {"v":{"response":{"message_id":2,"fragments":[{"type":"RESPONSE","content":""}]}}}',
+            'data: {"p":"response/fragments/-1/content","o":"APPEND","v":"Hello"}',
+            'data: {"v":" there"}',
+        ]
+        lines = head + head + ['data: {"v":", friend."}']
+        self.assertEqual(self._text(lines), "Hello there, friend.")
+
+    def test_snapshot_with_the_text_so_far_is_not_sent_twice(self):
+        lines = [
+            'data: {"v":{"response":{"message_id":2,"fragments":[{"type":"RESPONSE","content":"Hel"}]}}}',
+            'data: {"v":"lo"}',
+            'data: {"v":{"response":{"message_id":2,"fragments":[{"type":"RESPONSE","content":"Hello"}]}}}',
+            'data: {"p":"response/fragments/-1/content","o":"APPEND","v":"!"}',
+        ]
+        self.assertEqual(self._text(lines), "Hello!")
+
+    def test_fragments_set_whole_is_not_sent_twice(self):
+        lines = [
+            'data: {"v":{"response":{"message_id":2,"fragments":[]}}}',
+            'data: {"p":"response/fragments","o":"APPEND","v":[{"type":"THINK","content":"hm"}]}',
+            'data: {"p":"response/fragments","o":"APPEND","v":[{"type":"RESPONSE","content":"Hi"}]}',
+            'data: {"v":" you"}',
+            'data: {"p":"response/fragments","o":"SET","v":[{"type":"THINK","content":"hm"},'
+            '{"type":"RESPONSE","content":"Hi you"}]}',
+        ]
+        out = list(_parse_sse(_stream(*lines), {}))
+        self.assertEqual(out, [("thinking", "hm"), ("text", "Hi"), ("text", " you")])

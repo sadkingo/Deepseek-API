@@ -1122,8 +1122,26 @@ def _parse_sse_frames(lines, meta: Optional[dict] = None) -> Iterator[tuple]:
     the snapshot and any `.../message_id` path frame refine it afterwards.
     """
     active_path: Optional[str] = None
-    kind: Optional[str] = None  # event kind of the fragment appends target
+    # The response as the frames describe it, [kind, text] per fragment, and
+    # how much of each fragment's text has been yielded. Only text beyond that
+    # goes out: DeepSeek sometimes describes the response again mid-stream (a
+    # second snapshot with the deltas replayed after it, or the fragment list
+    # SET whole), and yielding that as new text sent the reply twice.
+    frags: list = []
+    sent: list = []
     snapshot_seen = False
+
+    def fresh() -> Iterator[tuple]:
+        for i, (k, text) in enumerate(frags):
+            if i == len(sent):
+                sent.append(0)
+            if k and len(text) > sent[i]:
+                yield (k, text[sent[i]:])
+                sent[i] = len(text)
+
+    def resent(what: str) -> None:
+        _log.warning("upstream described the response again mid-stream (%s); "
+                     "sending only the text not sent yet", what)
     event_name: Optional[str] = None  # the `event:` line preceding a `data:`
 
     for line in lines:
@@ -1181,17 +1199,19 @@ def _parse_sse_frames(lines, meta: Optional[dict] = None) -> Iterator[tuple]:
                 _capture_message_id(meta, v)
                 if v["response"].get("status") == _FILTERED_STATUS:
                     meta["content_filter"] = True
-            fragments = v["response"].get("fragments", [])
+            fragments = [f for f in v["response"].get("fragments") or []
+                         if isinstance(f, dict)]
             for frag in fragments:
                 if meta is not None and frag.get("type") == "TEMPLATE_RESPONSE":
                     meta["content_filter"] = True
-                frag_kind = _fragment_kind(frag.get("type"))
-                if frag_kind and frag.get("content") and not snapshot_seen:
-                    yield (frag_kind, frag["content"])
+            if snapshot_seen:
+                resent("a second snapshot")
+            frags = [[_fragment_kind(f.get("type")), f.get("content") or ""]
+                     for f in fragments]
             if fragments:
-                kind = _fragment_kind(fragments[-1].get("type"))
                 active_path = "response/fragments/-1/content"
             snapshot_seen = True
+            yield from fresh()
             continue
 
         # Path-setting frame.
@@ -1206,25 +1226,42 @@ def _parse_sse_frames(lines, meta: Optional[dict] = None) -> Iterator[tuple]:
             # New fragment(s) appended: emit their initial content and retarget
             # subsequent content appends at the (new) last fragment's type.
             if active_path.endswith("fragments") and isinstance(v, list):
-                for frag in v:
-                    if not isinstance(frag, dict):
-                        continue
+                new = [f for f in v if isinstance(f, dict)]
+                for frag in new:
                     if meta is not None and frag.get("type") == "TEMPLATE_RESPONSE":
                         meta["content_filter"] = True
-                    kind = _fragment_kind(frag.get("type"))
-                    if kind and frag.get("content"):
-                        yield (kind, frag["content"])
+                new = [[_fragment_kind(f.get("type")), f.get("content") or ""]
+                       for f in new]
+                if obj.get("o") == "SET":
+                    resent("the fragment list set whole")
+                    frags = new
+                else:
+                    frags += new
+                yield from fresh()
                 continue
             # Content delta ("o" is APPEND, or absent right after a new fragment).
             if obj.get("o") in (None, "APPEND") and isinstance(v, str) \
-                    and active_path.endswith("content") and kind:
-                yield (kind, v)
+                    and active_path.endswith("content"):
+                _append_content(frags, active_path, v)
+                yield from fresh()
             continue
 
         # Bare append to the current path.
-        if isinstance(v, str) and active_path \
-                and active_path.endswith("content") and kind:
-            yield (kind, v)
+        if isinstance(v, str) and active_path and active_path.endswith("content"):
+            _append_content(frags, active_path, v)
+            yield from fresh()
+
+
+_CONTENT_PATH = re.compile(r"fragments/(-?\d+)/content$")
+
+
+def _append_content(frags: list, path: str, text: str) -> None:
+    """Append `text` to the fragment `path` names ("response/fragments/-1/
+    content" is the last one)."""
+    m = _CONTENT_PATH.search(path)
+    i = int(m.group(1)) if m else -1
+    if frags and -len(frags) <= i < len(frags):
+        frags[i][1] += text
 
 
 def _capture_message_id(meta: dict, snapshot: dict) -> None:
