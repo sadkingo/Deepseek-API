@@ -337,3 +337,44 @@ class EveryReplyIsChecked(unittest.TestCase):
                  ("user", "sadking: why" + NOTE))
         m = idx.find(h, "acct")
         self.assertEqual((m.cid, m.reply_edited), ("sess:5", False))
+
+
+class SystemPromptOfAThread(unittest.TestCase):
+    def test_roots_record_it_and_later_turns_inherit_it(self):
+        from server.threads import system_hash
+        idx = TurnIndex(path=None)
+        h1 = hist(("user", "sadking: hi" + NOTE))
+        idx.remember(h1, "sess:2", None, "", "Hello.", "acct")
+        changed = [("system", SYS[1] + " Write out the user's directions.", "")] + \
+            hist(("user", "sadking: hi"), ("assistant", "Hello."), ("user", "sadking: go" + NOTE))[1:]
+        idx.remember(changed, "sess:4", "sess:2", "", "Going.", "acct")
+        self.assertEqual(idx.thread_system("sess:2"), system_hash(h1))
+        # The second turn sent only its new message: the thread still holds
+        # the prompt it began with, not the one in that request.
+        self.assertEqual(idx.thread_system("sess:4"), system_hash(h1))
+        self.assertNotEqual(system_hash(changed), system_hash(h1))
+
+    def test_unknown_records_are_filled_in_once(self):
+        idx = TurnIndex(path=None)
+        idx.remember(hist(("user", "hi")), "sess:2", None, "", "Hello.", "acct")
+        idx._turns["sess:2"].sys_hash = ""
+        idx.set_thread_system("sess", "abc")
+        self.assertEqual(idx.thread_system("sess:2"), "abc")
+        idx.set_thread_system("sess", "xyz")          # known ones are kept
+        self.assertEqual(idx.thread_system("sess:2"), "abc")
+
+
+class ResyncRetiresOldBranches(unittest.TestCase):
+    def test_only_the_resent_branch_is_left(self):
+        idx = TurnIndex(path=None)
+        h1 = hist(("user", "sadking: hi" + NOTE))
+        idx.remember(h1, "sess:2", None, "", "Hello.", "acct")
+        h2 = hist(("user", "sadking: hi"), ("assistant", "Hello."), ("user", "sadking: go" + NOTE))
+        idx.remember(h2, "sess:4", "sess:2", "", "Going.", "acct")
+        idx.remember(h2, "sess:6", None, "", "Going, again.", "acct")   # the resync root
+        idx.remember(hist(("user", "other chat")), "other:2", None, "", "Hi.", "acct")
+        idx.forget_others("sess", "sess:6")
+        self.assertEqual(sorted(idx._turns), ["other:2", "sess:6"])
+        # Swiping the resent turn regenerates it, not the old branch.
+        m = idx.find(h2, "acct")
+        self.assertEqual((m.cid, m.kind, m.regenerate_of), ("sess", "regenerate", 6))

@@ -1535,6 +1535,81 @@ def messages_to_prompt(messages: List[ChatMessage]) -> str:
     return "\n\n".join(t for t in texts if t)
 
 
+# Labels for a chat turn resent with the turns before it (after the user
+# edited an earlier reply, or turns the thread never saw). Without them the
+# whole block reads as story already told, and the model skips straight past
+# the newest message - narration the user wrote for other characters included.
+RESEND_EARLIER = "[Earlier turns, as they read now - these already happened:]"
+RESEND_NEWEST = "[New message - respond to this one:]"
+
+
+def resend_prompt(messages: List[ChatMessage]) -> str:
+    """The prompt for resuming a chat with several messages at once.
+
+    A conversation turn (the newest message from the user, with earlier
+    replies among what is resent) gets the earlier messages and the newest
+    one labelled apart. Anything else - one message, tool traffic, an
+    agent's history - goes verbatim, as `messages_to_prompt` does.
+    """
+    if len(messages) < 2 or messages[-1].role != "user":
+        return messages_to_prompt(messages)
+    if any(m.role in ("tool", "function") or m.tool_calls for m in messages):
+        return messages_to_prompt(messages)
+    if not any(m.role == "assistant" for m in messages[:-1]):
+        return messages_to_prompt(messages)
+    earlier = messages_to_prompt(messages[:-1])
+    newest = messages_to_prompt(messages[-1:])
+    if not earlier or not newest:
+        return messages_to_prompt(messages)
+    return f"{RESEND_EARLIER}\n\n{earlier}\n\n{RESEND_NEWEST}\n\n{newest}"
+
+
+# A block of the system prompt meant to come AFTER the chat history (what
+# SillyTavern calls post-history instructions, JanitorAI's "Advanced Prompt"
+# by intent). Frontends put it at the top, and a DeepSeek thread sees the top
+# only once, at its start; marked like this, it is moved behind the newest
+# message instead, on every turn.
+_POST_HISTORY = re.compile(r"\[POST-HISTORY\](.*?)\[/POST-HISTORY\]", re.S | re.I)
+
+
+def split_post_history(messages: List[ChatMessage]) -> Tuple[List[ChatMessage], str]:
+    """Take [POST-HISTORY]...[/POST-HISTORY] blocks out of the leading system
+    messages. Returns the messages without them and the blocks' text."""
+    out: List[ChatMessage] = []
+    blocks: List[str] = []
+    leading = True
+    for m in messages:
+        if leading and m.role in ("system", "developer"):
+            if isinstance(m.content, str) and _POST_HISTORY.search(m.content):
+                blocks += [b.strip() for b in _POST_HISTORY.findall(m.content) if b.strip()]
+                m = m.model_copy(update={"content": _POST_HISTORY.sub("", m.content).strip()})
+        else:
+            leading = False
+        out.append(m)
+    return out, "\n\n".join(blocks)
+
+
+def whole_history_prompt(messages: List[ChatMessage]) -> str:
+    """The prompt for a conversation sent whole (a new chat, or a chat resent
+    from its first message): the system prompt, then the turns so far labelled
+    as already happened, then the newest message labelled as the one to
+    answer. Agent histories (tools) and anything that does not end with the
+    user's message go verbatim, as `messages_to_prompt` does."""
+    if not messages or messages[-1].role != "user":
+        return messages_to_prompt(messages)
+    if any(m.role in ("tool", "function") or m.tool_calls for m in messages):
+        return messages_to_prompt(messages)
+    n_sys = 0
+    while n_sys < len(messages) and messages[n_sys].role in ("system", "developer"):
+        n_sys += 1
+    turns = messages[n_sys:-1]
+    if not any(m.role == "assistant" for m in turns):
+        return messages_to_prompt(messages)
+    parts = [messages_to_prompt(messages[:n_sys]), RESEND_EARLIER,
+             messages_to_prompt(turns), RESEND_NEWEST, messages_to_prompt(messages[-1:])]
+    return "\n\n".join(p for p in parts if p)
+
+
 def _now() -> int:
     return int(time.time())
 

@@ -113,6 +113,24 @@ def message_hash(text: str) -> str:
     return _h("\n".join(_lines(text)))
 
 
+def system_text(history: History) -> str:
+    """The leading system message(s), whitespace normalised."""
+    parts = []
+    for role, text, _ in history:
+        if role not in ("system", "developer"):
+            break
+        parts.append(text)
+    return " ".join(" ".join(parts).split())
+
+
+def system_hash(history: History) -> str:
+    """Hash of the WHOLE leading system prompt: a DeepSeek thread only sees it
+    in its first prompt, so a change to it never reaches a thread that goes
+    on (see `Turn.sys_hash`)."""
+    text = system_text(history)
+    return _h(text) if text else ""
+
+
 def system_head(history: History) -> str:
     """Hash of the opening of the leading system message(s)."""
     parts = []
@@ -237,6 +255,10 @@ class Turn:
     reply_hash: str = ""       # hash of the whole reply (`reply_key`): when the
     #   client's copy no longer matches, the user edited it ("" = not known
     #   yet; filled from DeepSeek's history before the state is resumed)
+    sys_hash: str = ""         # `system_hash` of the system prompt this thread
+    #   was started with (inherited from the root): when the client's system
+    #   prompt no longer matches it, the user changed their instructions and
+    #   the thread has not seen the change ("" = not known yet)
     carried_replies: Optional[List[str]] = None  # `reply_key` of each assistant
     #   message sent INSIDE this turn's prompt, oldest first: for a root, the
     #   greeting and history flattened into it; otherwise the replies resent
@@ -282,16 +304,23 @@ class Match:
     similarity: float = 0.0  # edits: how alike the new and old message are
     recovering: bool = False  # the state found was a refusal, so the turn is
     #   sent as an edit of the chat's first message instead
+    resync: bool = False      # the system prompt changed since the thread
+    #   began: the whole history is resent from the chat's first message
     reply_edited: bool = False  # a later state was passed over because the
     #   client edited the reply it produced: resending from before it
 
     @property
     def label(self) -> str:
         """Short upper-case verb for the log line."""
+        if self.resync:
+            return "RESYNC"
         return {"append": "RESUME", "continue": "CONTINUE",
                 "regenerate": "REGENERATE", "edit": "EDIT"}.get(self.kind, "RESUME")
 
     def describe(self) -> str:
+        if self.resync:
+            return ("system prompt changed since the chat began: the whole history "
+                    "goes again from the chat's first message")
         if self.recovering:
             why = ["the state this history continues from was a refusal: "
                    "editing the chat's first message with the whole history"]
@@ -457,6 +486,13 @@ class TurnIndex:
                  user_mid=user_mid, poisoned=poisoned,
                  reply_hash=reply_key(reply_text), carried_replies=carried_replies)
         with self._lock:
+            # The system prompt a thread holds is the one its root was sent
+            # with; later turns send only new messages, so they inherit it.
+            if parent is None:
+                t.sys_hash = system_hash(history)
+            else:
+                up = self._turns.get(parent)
+                t.sys_hash = up.sys_hash if up else ""
             # An account is replaced, never revisited (it was muted); its
             # threads are dead and only clutter the index.
             for cid in [c for c, o in self._turns.items() if o.account != account]:
@@ -474,6 +510,16 @@ class TurnIndex:
         session = conversation_id.partition(":")[0]
         with self._lock:
             for cid in [c for c, t in self._turns.items() if t.session == session]:
+                self._drop(cid)
+            self._save()
+
+    def forget_others(self, session: str, keep: str) -> None:
+        """Drop every record of `session` except `keep`: the chat was resent
+        whole from its first message (its system prompt changed), so the older
+        branches hold the old instructions and must not be resumed."""
+        with self._lock:
+            for cid in [c for c, t in self._turns.items()
+                        if t.session == session and c != keep]:
                 self._drop(cid)
             self._save()
 
@@ -806,6 +852,21 @@ class TurnIndex:
                     t.reply_hash = UNKNOWN_REPLY
             self._save()
         return n
+
+    def thread_system(self, cid: str) -> str:
+        """`sys_hash` of the thread state `cid` ("" when not known)."""
+        with self._lock:
+            t = self._turns.get(cid)
+            return t.sys_hash if t else ""
+
+    def set_thread_system(self, session: str, value: str) -> None:
+        """Record the system prompt `session` was started with, on every record
+        of it that does not know yet (records from before this existed)."""
+        with self._lock:
+            for t in self._turns.values():
+                if t.session == session and not t.sys_hash:
+                    t.sys_hash = value
+            self._save()
 
     @staticmethod
     def _reply_changed(t: Turn, history: History, pos: int) -> bool:

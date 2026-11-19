@@ -61,3 +61,58 @@ class TestOpenAIFormat(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class ResendPrompt(unittest.TestCase):
+    """A chat resumed with several messages at once (the 2026-11-01 case: the
+    previous reply had been edited, so the user's last message, the edited
+    reply and the new message went out together, and the model skipped the
+    narration in the new message as if it had already been shown)."""
+
+    def msgs(self, *pairs):
+        from server.schemas import ChatMessage
+        return [ChatMessage(role=r, content=c) for r, c in pairs]
+
+    def test_the_newest_message_is_labelled_as_the_one_to_answer(self):
+        from server.openai_format import RESEND_EARLIER, RESEND_NEWEST, resend_prompt
+        p = resend_prompt(self.msgs(
+            ("user", "sadking: *she thinks it over*"),
+            ("assistant", "*Liria watches her.*"),
+            ("user", "sadking: *Nikki cuts her off. It's not about cheating.*")))
+        self.assertEqual(p, f"{RESEND_EARLIER}\n\nsadking: *she thinks it over*\n\n"
+                            f"*Liria watches her.*\n\n{RESEND_NEWEST}\n\n"
+                            "sadking: *Nikki cuts her off. It's not about cheating.*")
+
+    def test_everything_else_goes_verbatim(self):
+        from server.openai_format import messages_to_prompt, resend_prompt
+        from server.schemas import ChatMessage
+        cases = [
+            self.msgs(("user", "just one")),
+            self.msgs(("user", "two"), ("user", "user messages")),     # no reply among them
+            self.msgs(("user", "q"), ("assistant", "a")),               # ends with a reply
+            [ChatMessage(role="assistant", content="", tool_calls=[{
+                "id": "c1", "type": "function",
+                "function": {"name": "read", "arguments": "{}"}}]),
+             ChatMessage(role="tool", content="file", tool_call_id="c1"),
+             ChatMessage(role="user", content="next")],                 # tool traffic
+        ]
+        for m in cases:
+            self.assertEqual(resend_prompt(m), messages_to_prompt(m))
+
+
+class WholeHistoryPrompt(unittest.TestCase):
+    def test_system_then_earlier_turns_then_the_newest_message(self):
+        from server.openai_format import RESEND_EARLIER, RESEND_NEWEST, whole_history_prompt
+        p = whole_history_prompt([
+            ChatMessage(role="system", content="RULES"),
+            ChatMessage(role="user", content="."),
+            ChatMessage(role="assistant", content="*Greeting.*"),
+            ChatMessage(role="user", content="sadking: *Nikki cuts her off.*")])
+        self.assertEqual(p, f"RULES\n\n{RESEND_EARLIER}\n\n.\n\n*Greeting.*\n\n"
+                            f"{RESEND_NEWEST}\n\nsadking: *Nikki cuts her off.*")
+
+    def test_agent_histories_and_bare_messages_go_verbatim(self):
+        from server.openai_format import messages_to_prompt, whole_history_prompt
+        for msgs in ([ChatMessage(role="system", content="S"), ChatMessage(role="user", content="hi")],
+                     [ChatMessage(role="user", content="q"), ChatMessage(role="assistant", content="a")]):
+            self.assertEqual(whole_history_prompt(msgs), messages_to_prompt(msgs))

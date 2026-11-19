@@ -440,6 +440,25 @@ class DeepSeekClient:
             _log.debug("thread navigation simulation skipped: %s", e)
             return None
 
+    def first_prompt(self, chat_session_id: str, message_id: int) -> Optional[str]:
+        """The text of the first user message on the branch that leads to
+        `message_id`: the prompt the chat (or this branch of it) was opened
+        with, which carries the system prompt. None when it cannot be read."""
+        messages = self._simulate_thread_navigation(chat_session_id)
+        if not messages:
+            return None
+        by_id = {m.get("message_id"): m for m in messages}
+        node, root, seen = by_id.get(message_id), None, set()
+        while node is not None and node.get("message_id") not in seen:
+            seen.add(node.get("message_id"))
+            if node.get("role") == "USER":
+                root = node
+            node = by_id.get(node.get("parent_id"))
+        if root is None:
+            return None
+        return "".join(f.get("content") or "" for f in root.get("fragments") or []
+                       if f.get("type") == "REQUEST")
+
     def reply_texts(self, chat_session_id: str) -> Optional[Dict[int, str]]:
         """The text of every assistant message in a chat, by message id, as
         DeepSeek stores it (reasoning and tips left out); None when the chat

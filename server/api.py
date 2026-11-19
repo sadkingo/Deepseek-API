@@ -64,6 +64,9 @@ from .openai_format import (
     message_images,
     message_texts,
     messages_to_prompt,
+    resend_prompt,
+    split_post_history,
+    whole_history_prompt,
     serialize_tool_call,
     stream_chunks,
     strip_role_leak,
@@ -74,7 +77,7 @@ from .openai_format import (
     injected_notes,
     split_trailing_notes,
 )
-from .threads import ThreadCache, TurnIndex
+from .threads import Match, ThreadCache, TurnIndex, system_hash, system_text
 from .ratelimit import RateLimiter, install_rate_limit
 from .schemas import ChatCompletionRequest, ChatMessage
 
@@ -243,6 +246,54 @@ def _relogin_client(failed: DeepSeekClient) -> DeepSeekClient:
             _client = fresh
         debuglog.log_error("signed in again; retrying the request")
         return fresh
+
+
+# A changed system prompt is resent with the whole history (see
+# `_system_changed`). Frontends that rebuild the prompt on every turn (lore
+# entries, memory) would otherwise trigger that every turn, so a chat is
+# resynced at most once per SYSTEM_RESYNC_COOLDOWN seconds.
+SYSTEM_RESYNC = os.getenv("SYSTEM_RESYNC", "1").lower() not in ("0", "false", "no", "off")
+SYSTEM_RESYNC_COOLDOWN = float(os.getenv("SYSTEM_RESYNC_COOLDOWN", "900"))
+_resynced_at: dict = {}
+_resync_lock = threading.Lock()
+
+
+async def _system_changed(client: DeepSeekClient, cid: str, history) -> bool:
+    """Whether the thread `cid` was started with a different system prompt than
+    the one in `history` - and a resync is allowed now.
+
+    Threads record the prompt they began with. For one recorded before that,
+    DeepSeek's copy of the chat's first prompt is read once: if it contains
+    the current system prompt the thread is up to date (and that is
+    recorded), otherwise it is not."""
+    if not SYSTEM_RESYNC:
+        return False
+    current = system_hash(history)
+    if not current:
+        return False
+    session = _session_of(cid)
+    known = _threads.thread_system(cid)
+    if not known:
+        mid = cid.partition(":")[2]
+        first = await run_in_threadpool(client.first_prompt, session, int(mid)) \
+            if mid.isdigit() else None
+        if first is None:
+            return False  # cannot tell; leave the thread alone
+        if system_text(history) in " ".join(first.split()):
+            _threads.set_thread_system(session, current)
+            return False
+        known = "(older prompt)"
+    if known == current:
+        return False
+    with _resync_lock:
+        last = _resynced_at.get(session, 0.0)
+        if time.time() - last < SYSTEM_RESYNC_COOLDOWN:
+            debuglog.log_thread(
+                f"the system prompt of chat {session} changed again within "
+                f"{SYSTEM_RESYNC_COOLDOWN:.0f}s of the last resync; not resending")
+            return False
+        _resynced_at[session] = time.time()
+    return True
 
 
 def _watchdog() -> None:
@@ -676,6 +727,20 @@ async def chat_completions(req: ChatCompletionRequest, request: Request):
                         f"filled in {filled} older repl{'y' if filled == 1 else 'ies'} "
                         f"of chat {session} from DeepSeek, to check them for edits")
                     match = _threads.find(history, account)
+        if match and not match.sibling and ":" in match.cid \
+                and await _system_changed(client, match.cid, history):
+            # The user changed their instructions (character card, system
+            # prompt) since this chat began. DeepSeek only ever saw the old
+            # ones, in the chat's first prompt; resending the whole history as
+            # a new branch from that first message hands it the current ones.
+            session = _session_of(match.cid)
+            debuglog.log_thread(
+                f"the system prompt changed since chat {session} began; resending "
+                "the whole history from its first message so DeepSeek works from "
+                "the current one")
+            match = Match(cid=session, resume_from=0, depth=match.depth, sys=False,
+                          head=False, exhaustive=match.exhaustive, sibling=True,
+                          kind="edit", resync=True)
         if match:
             conversation_id, resume_from = match.cid, match.resume_from
             debuglog.log_thread(
@@ -702,16 +767,29 @@ async def chat_completions(req: ChatCompletionRequest, request: Request):
     echo_lines = injected_notes(req.messages)
     notes_key = hashlib.sha1("\n".join(echo_lines).encode("utf-8")).hexdigest() \
         if echo_lines else ""
+    # Post-history instructions marked in the system prompt go after the
+    # newest message on every turn, not at the top where a thread sees them
+    # once. A reply that copies one of their lines has that line removed.
+    convo_messages, post_history = (req.messages, "") if req.tools \
+        else split_post_history(req.messages)
+    if post_history:
+        echo_lines = tuple(echo_lines) + tuple(
+            l.strip() for l in post_history.splitlines() if len(l.strip()) > 12)
 
     # The whole history as one prompt, used when starting a thread — and kept
     # around as the fallback for when a resumed thread turns out to be gone or
     # to have refused. Refusals the client kept in the history are left out:
     # replaying "I'm not going to engage with this content" would only teach
     # the new branch to say it again.
-    replayable = [m for m in req.messages
+    replayable = [m for m in convo_messages
                   if not (m.role == "assistant" and isinstance(m.content, str)
                           and is_refusal(m.content))]
-    fresh_prompt = messages_to_prompt(replayable)
+    # Without tools the newest message is labelled as the one to answer, so
+    # the model does not read it as more of the story already told.
+    fresh_prompt = messages_to_prompt(replayable) if req.tools \
+        else whole_history_prompt(replayable)
+    if post_history:
+        fresh_prompt = f"{fresh_prompt}\n\n{post_history}"
     if req.tools:
         fresh_prompt = f"{fresh_prompt}\n\n{tools_preamble(req.tools)}"
     # Replaying a whole agentic conversation gives the model a transcript with
@@ -742,12 +820,16 @@ async def chat_completions(req: ChatCompletionRequest, request: Request):
             # without it, so the note is stated once and not parroted back.
             body, _ = split_trailing_notes(new_msgs[-1].content)
             new_msgs = list(new_msgs[:-1]) + [ChatMessage(role="user", content=body)]
-        prompt = messages_to_prompt(new_msgs)
+        # Several messages at once (after an edited reply, say): the newest
+        # is labelled as the one to answer, the rest as already happened.
+        prompt = messages_to_prompt(new_msgs) if req.tools else resend_prompt(new_msgs)
         if match and match.continues:
             # The thread has seen everything; the client wants the reply this
             # state produced to go on. Echoing that reply back as a prompt
             # would make the model answer its own words instead.
             prompt = CONTINUE_PROMPT
+        elif post_history and prompt.strip():
+            prompt = f"{prompt}\n\n{post_history}"
         if not prompt.strip():
             # Nothing but empty or image-only entries: fall back to the last
             # message that does carry text.
@@ -831,6 +913,11 @@ async def chat_completions(req: ChatCompletionRequest, request: Request):
             _threads.remember(history, cid, parent, fingerprint, reply_text,
                               account=account, user_mid=user_mid,
                               poisoned=poisoned, carried_from=carried)
+            if match is not None and match.resync \
+                    and _session_of(cid) == _session_of(match.cid):
+                # The chat now continues from this resend; its older branches
+                # carry the old instructions and are never to be resumed.
+                _threads.forget_others(_session_of(cid), cid)
             if tools_fp:
                 # This thread has now seen these tools; later turns need not
                 # repeat the preamble unless the set changes again.
